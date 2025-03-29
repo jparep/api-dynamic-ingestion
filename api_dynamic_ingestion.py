@@ -3,11 +3,12 @@ import json
 import os
 from dotenv import load_dotenv
 import snowflake.connector
+from datetime import datetime
 
-# Load .env
+# Load environment variables
 load_dotenv()
 
-# Flatten + schema inference
+# Helpers
 def flatten_json(json_obj, prefix=''):
     flat = {}
     for key, value in json_obj.items():
@@ -19,7 +20,7 @@ def flatten_json(json_obj, prefix=''):
     return flat
 
 def infer_type(value):
-    if isinstance(value, int): return "NUMBER"
+    if isinstance(value, int): return "INT"
     if isinstance(value, float): return "FLOAT"
     if isinstance(value, bool): return "BOOLEAN"
     if isinstance(value, str): return "STRING"
@@ -28,18 +29,19 @@ def infer_type(value):
     if isinstance(value, list): return "ARRAY"
     return "STRING"
 
-# Config
+# Configs
 database = "covid"
 raw_schema = "raw3"
 stg_schema = "stg"
 raw_table = "COVID_COUNTRY_RAW"
 stg_table = "COVID_COUNTRY_STG"
+load_ts = datetime.utcnow().isoformat()
 
-# Step 1: Get COVID data
+# Step 1: Fetch data
 url = "https://disease.sh/v3/covid-19/countries"
-data = requests.get(url).json()[:10]  # For test limit
+data = requests.get(url).json()[:10]  # limit for test
 
-# Step 2: Infer schema
+# Step 2: Infer schema from sample
 flat_sample = flatten_json(data[0])
 schema = {k: infer_type(v) for k, v in flat_sample.items()}
 
@@ -54,77 +56,95 @@ conn = snowflake.connector.connect(
 )
 cursor = conn.cursor()
 
-# Use correct context
+# Step 4: Use context
 cursor.execute(f"USE DATABASE {database}")
 cursor.execute(f"USE SCHEMA {raw_schema}")
 
-# Step 4: Create RAW table
+# Step 5: Create RAW table with metadata
 cursor.execute(f"""
     CREATE TABLE IF NOT EXISTS {raw_table} (
         country STRING,
         source_record VARIANT,
-        ingest_time TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP
+        ingest_time TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP,
+        load_ts STRING,
+        source STRING
     );
 """)
+cursor.execute(f'ALTER TABLE {raw_table} CLUSTER BY (country, ingest_time)')
 
-# Step 5: Insert raw JSON records
+# Step 6: Insert raw JSON
 for record in data:
     country = record.get("country", "UNKNOWN")
     json_text = json.dumps(record).replace("'", "''")
     cursor.execute(f"""
-        INSERT INTO {raw_table} (country, source_record)
-        SELECT '{country}', PARSE_JSON('{json_text}');
+        INSERT INTO {raw_table} (country, source_record, load_ts, source)
+        SELECT '{country}', PARSE_JSON('{json_text}'), '{load_ts}', 'api-disease.sh';
     """)
 
-print(f"Inserted {len(data)} records into {raw_schema}.{raw_table}")
+print(f"✅ Inserted {len(data)} rows into {raw_schema}.{raw_table}")
 
-# Step 6: Create or evolve STAGING table
+# Step 7: Prepare STAGING table
 cursor.execute(f"USE SCHEMA {stg_schema}")
 try:
     cursor.execute(f"DESCRIBE TABLE {stg_table}")
     existing_cols = set([row[0].lower() for row in cursor.fetchall()])
-    print(f"Table {stg_table} exists.")
+    print(f"✅ STAGING table exists: {stg_table}")
 except:
     col_defs = ",\n".join([
         f'"{k.replace(".", "_").lower()}" {v}' for k, v in schema.items()
     ])
+    col_defs += ', "load_ts" STRING, "source" STRING'
     cursor.execute(f"CREATE TABLE {stg_table} ({col_defs});")
-    existing_cols = set([k.replace(".", "_").lower() for k in schema])
-    print(f"Created table: {stg_table}")
+    existing_cols = set([k.replace(".", "_").lower() for k in schema] + ["load_ts", "source"])
+    print(f"✅ Created STAGING table: {stg_table}")
 
-# Step 7: Add missing columns
+# Step 8: Evolve schema if needed
 for k, v in schema.items():
     col = k.replace(".", "_").lower()
     if col not in existing_cols:
         cursor.execute(f'ALTER TABLE {stg_table} ADD COLUMN "{col}" {v};')
-        print(f"Added column: {col} ({v})")
+        print(f"➕ Added column: {col} ({v})")
 
-# Step 8: Dynamically flatten & insert from RAW → STAGING
+for meta_col in [("load_ts", "STRING"), ("source", "STRING")]:
+    col, dtype = meta_col
+    if col not in existing_cols:
+        cursor.execute(f'ALTER TABLE {stg_table} ADD COLUMN "{col}" {dtype};')
+        print(f"➕ Added metadata column: {col} ({dtype})")
+
+# Step 9: Apply clustering to staging table
+try:
+    cursor.execute(f'ALTER TABLE {stg_table} CLUSTER BY ("country", "updated")')
+    print(f"✅ Applied clustering on country and updated")
+except:
+    print("⚠️ Could not apply clustering. Might already be clustered.")
+
+# Step 10: Build dynamic insert from RAW → STAGING
 column_map = {
-    "country": "country"  # keep country as-is
+    "country": "country",
+    "load_ts": "load_ts",
+    "source": "source"
 }
 for k, v in schema.items():
     col = k.replace(".", "_").lower()
-    path = k.replace('"', '')  # remove quotes from key
-    column_map[col] = f'source_record:{path}::{v}'
+    json_path = k.replace('"', '')
+    column_map[col] = f'source_record:{json_path}::{v}'
 
-# Build dynamic insert SQL
-col_names = ', '.join([f'"{c}"' for c in column_map.keys()])
-col_exprs = ',\n  '.join([f'{v} AS "{k}"' for k, v in column_map.items()])
+col_names = ', '.join([f'"{col}"' for col in column_map.keys()])
+col_exprs = ',\n  '.join([f'{expr} AS "{col}"' for col, expr in column_map.items()])
 
-flatten_insert_sql = f"""
+insert_flattened_sql = f"""
     INSERT INTO {stg_schema}.{stg_table} (
         {col_names}
     )
     SELECT
-      {col_exprs}
-    FROM {raw_schema}.{raw_table};
+        {col_exprs}
+    FROM {raw_schema}.{raw_table}
+    WHERE load_ts = '{load_ts}';
 """
 
-# Step 9: Run dynamic insert
-cursor.execute(flatten_insert_sql)
-print(f"Flattened records inserted into {stg_schema}.{stg_table}")
+cursor.execute(insert_flattened_sql)
+print(f"✅ Flattened rows inserted into {stg_schema}.{stg_table}")
 
-# Done
+# Cleanup
 cursor.close()
 conn.close()
