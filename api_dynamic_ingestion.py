@@ -4,10 +4,10 @@ import os
 from dotenv import load_dotenv
 import snowflake.connector
 
-# Load credentials
+# Load credentials from .env file
 load_dotenv()
 
-# Infer Snowflake-compatible types
+# Function to infer Snowflake-compatible data types
 def infer_type(value):
     if isinstance(value, int): return "NUMBER"
     if isinstance(value, float): return "FLOAT"
@@ -18,7 +18,7 @@ def infer_type(value):
     if isinstance(value, list): return "ARRAY"
     return "STRING"
 
-# Flatten nested JSON
+# Recursively flatten nested JSON
 def flatten_json(json_obj, prefix=''):
     fields = {}
     for key, value in json_obj.items():
@@ -36,17 +36,17 @@ database = "covid"
 raw_table = "COVID_COUNTRY_RAW"
 stg_table = "COVID_COUNTRY_STG"
 
-# Step 1: Fetch 10 sample rows from COVID API
+# Step 1: Fetch sample COVID data
 url = "https://disease.sh/v3/covid-19/countries"
 response = requests.get(url)
-data = response.json()[:10]  # Just 10 rows for test
+data = response.json()[:10]  # Limit to 10 records for testing
 
-# Step 2: Build flattened schema
+# Step 2: Flatten and infer schema from sample data
 full_schema = {}
 for sample in data:
     flat = flatten_json(sample)
     for k, v in flat.items():
-        full_schema[k] = v  # preserve last type seen
+        full_schema[k] = v
 
 # Step 3: Connect to Snowflake
 conn = snowflake.connector.connect(
@@ -59,11 +59,11 @@ conn = snowflake.connector.connect(
 )
 cursor = conn.cursor()
 
-# Step 4: Use RAW schema and insert JSON into raw table
+# Use correct database/schema
 cursor.execute(f"USE DATABASE {database}")
 cursor.execute(f"USE SCHEMA {raw_schema}")
 
-# Create raw table if not exists
+# Step 4: Create RAW table if not exists
 cursor.execute(f"""
     CREATE TABLE IF NOT EXISTS {raw_table} (
         country STRING,
@@ -72,26 +72,25 @@ cursor.execute(f"""
     );
 """)
 
-# Insert raw records
+# Step 5: Insert raw JSON records into RAW table
 insert_sql = f"""
     INSERT INTO {raw_table} (country, source_record)
-    VALUES (%s, PARSE_JSON(%s));
+    VALUES (%s, %s);
 """
 
-raw_rows = [
-    (rec.get("country", "UNKNOWN"), json.dumps(rec)) for rec in data
-]
-cursor.executemany(insert_sql, raw_rows)
-print(f"✅ Inserted {len(raw_rows)} raw rows into {raw_schema}.{raw_table}")
+for rec in data:
+    country = rec.get("country", "UNKNOWN")
+    cursor.execute(insert_sql, (country, rec))  # rec as dict
 
-# Step 5: Switch to STAGING and manage dynamic schema
+print(f"✅ Inserted {len(data)} raw records into {raw_schema}.{raw_table}")
+
+# Step 6: Switch to STAGING and evolve schema
 cursor.execute(f"USE SCHEMA {stg_schema}")
 
 try:
-    # Check if STAGING table exists
     cursor.execute(f"DESCRIBE TABLE {stg_table}")
     existing_cols = set([row[0].lower() for row in cursor.fetchall()])
-    print(f"✅ STAGING table {stg_table} exists. Checking for new columns...")
+    print(f"✅ Table {stg_table} exists. Checking for missing columns...")
 except snowflake.connector.errors.ProgrammingError:
     print(f"⚠️ Table {stg_table} does not exist. Creating...")
     col_defs = ",\n".join([
@@ -99,17 +98,18 @@ except snowflake.connector.errors.ProgrammingError:
     ])
     cursor.execute(f"CREATE TABLE {stg_table} ({col_defs});")
     existing_cols = set([k.replace(".", "_").lower() for k in full_schema])
-    print(f"✅ Created STAGING table {stg_table}.")
+    print(f"✅ Created table {stg_table} with initial schema.")
 
-# Step 6: Add new columns (if any)
+# Step 7: Add any new fields as columns
 for k, dtype in full_schema.items():
     col = k.replace(".", "_").lower()
     if col not in existing_cols:
         alter_sql = f'ALTER TABLE {stg_table} ADD COLUMN "{col}" {dtype};'
-        print(f"➕ Adding new column: {col} ({dtype})")
+        print(f"➕ Adding column: {col} ({dtype})")
         cursor.execute(alter_sql)
 
-print("✅ Flattened staging schema updated successfully.")
+print("✅ Staging table schema synchronized successfully.")
 
+# Cleanup
 cursor.close()
 conn.close()
