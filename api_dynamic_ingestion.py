@@ -4,10 +4,12 @@ import os
 from dotenv import load_dotenv
 import snowflake.connector
 
-# Load credentials from .env file
+# Load environment variables from .env
 load_dotenv()
 
-# Function to infer Snowflake-compatible data types
+# --------------------------
+# Type Inference for Snowflake
+# --------------------------
 def infer_type(value):
     if isinstance(value, int): return "NUMBER"
     if isinstance(value, float): return "FLOAT"
@@ -18,7 +20,9 @@ def infer_type(value):
     if isinstance(value, list): return "ARRAY"
     return "STRING"
 
-# Recursively flatten nested JSON
+# --------------------------
+# JSON Flattener
+# --------------------------
 def flatten_json(json_obj, prefix=''):
     fields = {}
     for key, value in json_obj.items():
@@ -29,26 +33,32 @@ def flatten_json(json_obj, prefix=''):
             fields[full_key] = infer_type(value)
     return fields
 
-# Constants
+# --------------------------
+# Configs
+# --------------------------
 raw_schema = "raw3"
 stg_schema = "stg"
 database = "covid"
 raw_table = "COVID_COUNTRY_RAW"
 stg_table = "COVID_COUNTRY_STG"
 
-# Step 1: Fetch sample COVID data
+# --------------------------
+# Step 1: Fetch Sample Data
+# --------------------------
 url = "https://disease.sh/v3/covid-19/countries"
 response = requests.get(url)
-data = response.json()[:10]  # Limit to 10 records for testing
+data = response.json()[:10]  # Limit to 10 for test
 
-# Step 2: Flatten and infer schema from sample data
+# Flatten and infer schema
 full_schema = {}
-for sample in data:
-    flat = flatten_json(sample)
+for record in data:
+    flat = flatten_json(record)
     for k, v in flat.items():
         full_schema[k] = v
 
-# Step 3: Connect to Snowflake
+# --------------------------
+# Step 2: Connect to Snowflake
+# --------------------------
 conn = snowflake.connector.connect(
     user=os.getenv("SNOWFLAKE_USER"),
     password=os.getenv("SNOWFLAKE_PASSWORD"),
@@ -59,11 +69,12 @@ conn = snowflake.connector.connect(
 )
 cursor = conn.cursor()
 
-# Use correct database/schema
 cursor.execute(f"USE DATABASE {database}")
 cursor.execute(f"USE SCHEMA {raw_schema}")
 
-# Step 4: Create RAW table if not exists
+# --------------------------
+# Step 3: Create RAW Table if Not Exists
+# --------------------------
 cursor.execute(f"""
     CREATE TABLE IF NOT EXISTS {raw_table} (
         country STRING,
@@ -72,25 +83,28 @@ cursor.execute(f"""
     );
 """)
 
-# Step 5: Insert raw JSON records into RAW table
-insert_sql = f"""
-    INSERT INTO {raw_table} (country, source_record)
-    VALUES (%s, %s);
-"""
+# --------------------------
+# Step 4: Insert Raw Data with PARSE_JSON
+# --------------------------
+for record in data:
+    country = record.get("country", "UNKNOWN")
+    json_text = json.dumps(record).replace("'", "''")  # escape single quotes
+    insert_sql = f"""
+        INSERT INTO {raw_table} (country, source_record)
+        VALUES (%s, PARSE_JSON('{json_text}'));
+    """
+    cursor.execute(insert_sql, (country,))
+print(f"✅ Inserted {len(data)} rows into RAW table: {raw_schema}.{raw_table}")
 
-for rec in data:
-    country = rec.get("country", "UNKNOWN")
-    cursor.execute(insert_sql, (country, rec))  # rec as dict
-
-print(f"✅ Inserted {len(data)} raw records into {raw_schema}.{raw_table}")
-
-# Step 6: Switch to STAGING and evolve schema
+# --------------------------
+# Step 5: Create/Update STAGING Table
+# --------------------------
 cursor.execute(f"USE SCHEMA {stg_schema}")
 
 try:
     cursor.execute(f"DESCRIBE TABLE {stg_table}")
     existing_cols = set([row[0].lower() for row in cursor.fetchall()])
-    print(f"✅ Table {stg_table} exists. Checking for missing columns...")
+    print(f"✅ Table {stg_table} exists. Checking for new fields...")
 except snowflake.connector.errors.ProgrammingError:
     print(f"⚠️ Table {stg_table} does not exist. Creating...")
     col_defs = ",\n".join([
@@ -98,18 +112,22 @@ except snowflake.connector.errors.ProgrammingError:
     ])
     cursor.execute(f"CREATE TABLE {stg_table} ({col_defs});")
     existing_cols = set([k.replace(".", "_").lower() for k in full_schema])
-    print(f"✅ Created table {stg_table} with initial schema.")
+    print(f"✅ Created table: {stg_schema}.{stg_table}")
 
-# Step 7: Add any new fields as columns
-for k, dtype in full_schema.items():
-    col = k.replace(".", "_").lower()
-    if col not in existing_cols:
-        alter_sql = f'ALTER TABLE {stg_table} ADD COLUMN "{col}" {dtype};'
-        print(f"➕ Adding column: {col} ({dtype})")
+# --------------------------
+# Step 6: Alter Table to Add New Fields Dynamically
+# --------------------------
+for key, dtype in full_schema.items():
+    col_name = key.replace(".", "_").lower()
+    if col_name not in existing_cols:
+        alter_sql = f'ALTER TABLE {stg_table} ADD COLUMN "{col_name}" {dtype};'
+        print(f"➕ Adding column: {col_name} ({dtype})")
         cursor.execute(alter_sql)
 
-print("✅ Staging table schema synchronized successfully.")
+print(f"✅ STAGING table schema is up to date: {stg_schema}.{stg_table}")
 
+# --------------------------
 # Cleanup
+# --------------------------
 cursor.close()
 conn.close()
