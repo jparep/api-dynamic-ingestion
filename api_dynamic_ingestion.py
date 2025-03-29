@@ -4,12 +4,10 @@ import os
 from dotenv import load_dotenv
 import snowflake.connector
 
-# Load environment variables from .env
+# Load .env values
 load_dotenv()
 
-# --------------------------
-# Type Inference for Snowflake
-# --------------------------
+# Infer Snowflake-compatible types
 def infer_type(value):
     if isinstance(value, int): return "NUMBER"
     if isinstance(value, float): return "FLOAT"
@@ -20,9 +18,7 @@ def infer_type(value):
     if isinstance(value, list): return "ARRAY"
     return "STRING"
 
-# --------------------------
-# JSON Flattener
-# --------------------------
+# Flatten JSON recursively
 def flatten_json(json_obj, prefix=''):
     fields = {}
     for key, value in json_obj.items():
@@ -33,32 +29,26 @@ def flatten_json(json_obj, prefix=''):
             fields[full_key] = infer_type(value)
     return fields
 
-# --------------------------
-# Configs
-# --------------------------
+# Config
+database = "covid"
 raw_schema = "raw3"
 stg_schema = "stg"
-database = "covid"
 raw_table = "COVID_COUNTRY_RAW"
 stg_table = "COVID_COUNTRY_STG"
 
-# --------------------------
-# Step 1: Fetch Sample Data
-# --------------------------
+# Fetch COVID data
 url = "https://disease.sh/v3/covid-19/countries"
 response = requests.get(url)
-data = response.json()[:10]  # Limit to 10 for test
+data = response.json()[:10]  # Limit to 10 records
 
-# Flatten and infer schema
+# Infer schema from flattened sample
 full_schema = {}
 for record in data:
     flat = flatten_json(record)
     for k, v in flat.items():
         full_schema[k] = v
 
-# --------------------------
-# Step 2: Connect to Snowflake
-# --------------------------
+# Connect to Snowflake
 conn = snowflake.connector.connect(
     user=os.getenv("SNOWFLAKE_USER"),
     password=os.getenv("SNOWFLAKE_PASSWORD"),
@@ -69,12 +59,9 @@ conn = snowflake.connector.connect(
 )
 cursor = conn.cursor()
 
+# Step 1: RAW TABLE CREATION
 cursor.execute(f"USE DATABASE {database}")
 cursor.execute(f"USE SCHEMA {raw_schema}")
-
-# --------------------------
-# Step 3: Create RAW Table if Not Exists
-# --------------------------
 cursor.execute(f"""
     CREATE TABLE IF NOT EXISTS {raw_table} (
         country STRING,
@@ -83,28 +70,25 @@ cursor.execute(f"""
     );
 """)
 
-# --------------------------
-# Step 4: Insert Raw Data with PARSE_JSON
-# --------------------------
+# Step 2: INSERT RAW RECORDS (escaped JSON with PARSE_JSON)
 for record in data:
     country = record.get("country", "UNKNOWN")
-    json_text = json.dumps(record).replace("'", "''")  # escape single quotes
+    json_text = json.dumps(record).replace("'", "''")  # escape for SQL
+
     insert_sql = f"""
-        INSERT INTO {raw_table} (country, source_record)
-        VALUES (%s, PARSE_JSON('{json_text}'));
+        INSERT INTO {raw_schema}.{raw_table} (country, source_record)
+        SELECT '{country}', PARSE_JSON('{json_text}')
     """
-    cursor.execute(insert_sql, (country,))
-print(f"✅ Inserted {len(data)} rows into RAW table: {raw_schema}.{raw_table}")
+    cursor.execute(insert_sql)
 
-# --------------------------
-# Step 5: Create/Update STAGING Table
-# --------------------------
+print(f"✅ Inserted {len(data)} rows into {raw_schema}.{raw_table}")
+
+# Step 3: STAGING SCHEMA MANAGEMENT
 cursor.execute(f"USE SCHEMA {stg_schema}")
-
 try:
     cursor.execute(f"DESCRIBE TABLE {stg_table}")
     existing_cols = set([row[0].lower() for row in cursor.fetchall()])
-    print(f"✅ Table {stg_table} exists. Checking for new fields...")
+    print(f"✅ Table {stg_table} exists. Checking for new columns...")
 except snowflake.connector.errors.ProgrammingError:
     print(f"⚠️ Table {stg_table} does not exist. Creating...")
     col_defs = ",\n".join([
@@ -112,11 +96,9 @@ except snowflake.connector.errors.ProgrammingError:
     ])
     cursor.execute(f"CREATE TABLE {stg_table} ({col_defs});")
     existing_cols = set([k.replace(".", "_").lower() for k in full_schema])
-    print(f"✅ Created table: {stg_schema}.{stg_table}")
+    print(f"✅ Created table {stg_schema}.{stg_table}")
 
-# --------------------------
-# Step 6: Alter Table to Add New Fields Dynamically
-# --------------------------
+# Step 4: Add new fields to STAGING table if needed
 for key, dtype in full_schema.items():
     col_name = key.replace(".", "_").lower()
     if col_name not in existing_cols:
@@ -124,10 +106,8 @@ for key, dtype in full_schema.items():
         print(f"➕ Adding column: {col_name} ({dtype})")
         cursor.execute(alter_sql)
 
-print(f"✅ STAGING table schema is up to date: {stg_schema}.{stg_table}")
+print(f"✅ STAGING table schema is up-to-date: {stg_schema}.{stg_table}")
 
-# --------------------------
 # Cleanup
-# --------------------------
 cursor.close()
 conn.close()
