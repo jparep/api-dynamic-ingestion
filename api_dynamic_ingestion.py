@@ -6,37 +6,25 @@ from datetime import datetime
 from dotenv import load_dotenv
 import snowflake.connector
 
-# Load secrets
+# ░░ Load environment secrets
 load_dotenv()
 
-# Flatten JSON
-def flatten_json(json_obj, prefix=''):
+# ░░ Flatten JSON utility
+def flatten_json(obj, prefix=''):
     flat = {}
-    for key, value in json_obj.items():
-        full_key = f"{prefix}.{key}" if prefix else key
-        if isinstance(value, dict):
-            flat.update(flatten_json(value, prefix=full_key))
+    for k, v in obj.items():
+        full_key = f"{prefix}.{k}" if prefix else k
+        if isinstance(v, dict):
+            flat.update(flatten_json(v, prefix=full_key))
         else:
-            flat[full_key] = value
+            flat[full_key] = v
     return flat
 
-# Infer type
-def infer_type(value):
-    if isinstance(value, int): return "INT"
-    if isinstance(value, float): return "FLOAT"
-    if isinstance(value, bool): return "BOOLEAN"
-    if isinstance(value, str): return "STRING"
-    if value is None: return "STRING"
-    if isinstance(value, dict): return "VARIANT"
-    if isinstance(value, list): return "ARRAY"
-    return "STRING"
+# ░░ Hash fingerprint for deduplication
+def get_fingerprint(record):
+    return hashlib.sha256(json.dumps(record, sort_keys=True).encode()).hexdigest()
 
-# Fingerprint
-def get_record_fingerprint(record):
-    canonical = json.dumps(record, sort_keys=True)
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-# Config
+# ░░ Config
 database = "covid"
 raw_schema = "raw3"
 meta_schema = "meta"
@@ -44,13 +32,12 @@ raw_table = "COVID_COUNTRY_RAW"
 source_name = "api-disease.sh"
 load_ts = datetime.utcnow().isoformat()
 
-# 1. Fetch data
+# ░░ Step 1: Get data from COVID API
 url = "https://disease.sh/v3/covid-19/countries"
-data = requests.get(url).json()[:10]  # test limit
-flat_sample = flatten_json(data[0])
-schema = {k: infer_type(v) for k, v in flat_sample.items()}
+response = requests.get(url)
+data = response.json()[:10]  # limit for testing
 
-# 2. Connect to Snowflake
+# ░░ Step 2: Connect to Snowflake
 conn = snowflake.connector.connect(
     user=os.getenv("SNOWFLAKE_USER"),
     password=os.getenv("SNOWFLAKE_PASSWORD"),
@@ -63,39 +50,38 @@ cursor = conn.cursor()
 cursor.execute(f"USE DATABASE {database}")
 cursor.execute(f"USE SCHEMA {raw_schema}")
 
-# 3. Insert raw data with deduplication
+# ░░ Step 3: Insert only new rows (deduplicated)
 new_rows = 0
 for record in data:
-    fingerprint = get_record_fingerprint(record)
+    fingerprint = get_fingerprint(record)
     country = record.get("country", "UNKNOWN")
 
-    cursor.execute(f"""
-        SELECT COUNT(*) FROM {raw_table}
-        WHERE record_hash = %s
-    """, (fingerprint,))
-    
+    cursor.execute(f"SELECT COUNT(*) FROM {raw_table} WHERE record_hash = %s", (fingerprint,))
     if cursor.fetchone()[0] == 0:
-        json_text = json.dumps(record).replace("'", "''")
+        json_str = json.dumps(record).replace("'", "''")
         cursor.execute(f"""
             INSERT INTO {raw_table} (country, source_record, record_hash, load_ts, source)
             SELECT %s, PARSE_JSON(%s), %s, %s, %s
-        """, (country, json_text, fingerprint, load_ts, source_name))
+        """, (country, json_str, fingerprint, load_ts, source_name))
         new_rows += 1
 
-# 4. Call flattening and archive logic (in Snowflake SQL stored procedure)
+print(f"✅ Inserted {new_rows} new records into {raw_schema}.{raw_table}")
+
+# ░░ Step 4: Call Snowflake Stored Procedure to Flatten + Archive
 cursor.execute(f"""
-    CALL {database}.meta.PROC_FLATTEN_AND_ARCHIVE('{load_ts}', '{source_name}');
+    CALL {database}.{meta_schema}.PROC_FLATTEN_AND_ARCHIVE('{load_ts}', '{source_name}');
 """)
 
-# 5. Audit log
+# ░░ Step 5: Audit Log
 cursor.execute(f"""
-    INSERT INTO {database}.meta.INGEST_AUDIT_LOG
+    INSERT INTO {database}.{meta_schema}.INGEST_AUDIT_LOG
     (load_ts, table_name, record_count, duplicates_skipped, source)
     VALUES (%s, %s, %s, %s, %s)
 """, (load_ts, raw_table, new_rows, len(data) - new_rows, source_name))
 
-print(f"✅ {new_rows} new records ingested.")
-print(f"📞 Archival and flattening triggered via stored procedure.")
+print("📦 Archival and flattening logic executed.")
+print(f"🗓️  Logged audit for load timestamp: {load_ts}")
 
+# ░░ Close connection
 cursor.close()
 conn.close()
