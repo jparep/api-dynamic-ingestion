@@ -76,28 +76,28 @@ for record in data:
         SELECT '{country}', PARSE_JSON('{json_text}');
     """)
 
-print(f"✅ Inserted {len(data)} records into {raw_schema}.{raw_table}")
+print(f"Inserted {len(data)} records into {raw_schema}.{raw_table}")
 
 # Step 6: Create or evolve STAGING table
 cursor.execute(f"USE SCHEMA {stg_schema}")
 try:
     cursor.execute(f"DESCRIBE TABLE {stg_table}")
     existing_cols = set([row[0].lower() for row in cursor.fetchall()])
-    print(f"✅ Table {stg_table} exists.")
+    print(f"Table {stg_table} exists.")
 except:
     col_defs = ",\n".join([
         f'"{k.replace(".", "_").lower()}" {v}' for k, v in schema.items()
     ])
     cursor.execute(f"CREATE TABLE {stg_table} ({col_defs});")
     existing_cols = set([k.replace(".", "_").lower() for k in schema])
-    print(f"✅ Created table: {stg_table}")
+    print(f"Created table: {stg_table}")
 
 # Step 7: Add missing columns
 for k, v in schema.items():
     col = k.replace(".", "_").lower()
     if col not in existing_cols:
         cursor.execute(f'ALTER TABLE {stg_table} ADD COLUMN "{col}" {v};')
-        print(f"➕ Added column: {col} ({v})")
+        print(f"Added column: {col} ({v})")
 
 # Step 8: Dynamically flatten & insert from RAW → STAGING
 column_map = {
@@ -123,7 +123,7 @@ flatten_insert_sql = f"""
 
 # Step 9: Run dynamic insert
 cursor.execute(flatten_insert_sql)
-print(f"✅ Flattened records inserted into {stg_schema}.{stg_table}")
+print(f"Flattened records inserted into {stg_schema}.{stg_table}")
 
 # Done
 cursor.close()
