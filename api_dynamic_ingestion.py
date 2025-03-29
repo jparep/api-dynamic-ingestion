@@ -33,11 +33,14 @@ source_name = "api-disease.sh"
 load_ts = datetime.utcnow().isoformat()
 
 # ░░ Step 1: Get data from COVID API
+print(f"Fetching data from COVID API at {datetime.now()}")
 url = "https://disease.sh/v3/covid-19/countries"
 response = requests.get(url)
 data = response.json()[:10]  # limit for testing
+print(f"Fetched {len(data)} records")
 
 # ░░ Step 2: Connect to Snowflake
+print("Connecting to Snowflake...")
 conn = snowflake.connector.connect(
     user=os.getenv("SNOWFLAKE_USER"),
     password=os.getenv("SNOWFLAKE_PASSWORD"),
@@ -49,13 +52,15 @@ conn = snowflake.connector.connect(
 cursor = conn.cursor()
 cursor.execute(f"USE DATABASE {database}")
 cursor.execute(f"USE SCHEMA {raw_schema}")
+print("Connected to Snowflake")
 
 # ░░ Step 3: Insert only new rows (deduplicated)
+print("Beginning data insertion...")
 new_rows = 0
 for record in data:
     fingerprint = get_fingerprint(record)
     country = record.get("country", "UNKNOWN")
-
+    # Check if the record already exists by fingerprint
     cursor.execute(f"SELECT COUNT(*) FROM {raw_table} WHERE record_hash = %s", (fingerprint,))
     if cursor.fetchone()[0] == 0:
         json_str = json.dumps(record).replace("'", "''")
@@ -68,11 +73,15 @@ for record in data:
 print(f"Inserted {new_rows} new records into {raw_schema}.{raw_table}")
 
 # ░░ Step 4: Call Snowflake Stored Procedure to Flatten + Archive
+print("Calling flattening and archiving procedure...")
 cursor.execute(f"""
     CALL {database}.{meta_schema}.PROC_FLATTEN_AND_ARCHIVE('{load_ts}', '{source_name}');
 """)
+result = cursor.fetchone()
+print(f"Procedure result: {result[0]}")
 
 # ░░ Step 5: Audit Log
+print("Logging audit information...")
 cursor.execute(f"""
     INSERT INTO {database}.{meta_schema}.INGEST_AUDIT_LOG
     (load_ts, table_name, record_count, duplicates_skipped, source)
@@ -85,3 +94,4 @@ print(f"Logged audit for load timestamp: {load_ts}")
 # ░░ Close connection
 cursor.close()
 conn.close()
+print("Process completed successfully!")
