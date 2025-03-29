@@ -4,10 +4,10 @@ import os
 from dotenv import load_dotenv
 import snowflake.connector
 
-# Load environment variables from .env file
+# Load credentials
 load_dotenv()
 
-# Infer Snowflake-compatible types
+# Type inference for Snowflake
 def infer_type(value):
     if isinstance(value, int): return "NUMBER"
     if isinstance(value, float): return "FLOAT"
@@ -18,7 +18,7 @@ def infer_type(value):
     if isinstance(value, list): return "ARRAY"
     return "STRING"
 
-# Flatten nested JSON
+# JSON flattener
 def flatten_json(json_obj, prefix=''):
     fields = {}
     for key, value in json_obj.items():
@@ -29,26 +29,26 @@ def flatten_json(json_obj, prefix=''):
             fields[full_key] = infer_type(value)
     return fields
 
-# Configs
+# Config
 database = "covid"
 raw_schema = "raw3"
 stg_schema = "stg"
 raw_table = "COVID_COUNTRY_RAW"
 stg_table = "COVID_COUNTRY_STG"
 
-# Fetch COVID API data (10 records)
+# Step 1: Fetch COVID data
 url = "https://disease.sh/v3/covid-19/countries"
 response = requests.get(url)
-data = response.json()[:10]
+data = response.json()[:10]  # Limit to 10 for test. REMOVE [:10] for full production run.
 
-# Build full schema by flattening
+# Step 2: Flatten schema
 full_schema = {}
 for record in data:
     flat = flatten_json(record)
     for k, v in flat.items():
         full_schema[k] = v
 
-# Connect to Snowflake
+# Step 3: Connect to Snowflake
 conn = snowflake.connector.connect(
     user=os.getenv("SNOWFLAKE_USER"),
     password=os.getenv("SNOWFLAKE_PASSWORD"),
@@ -59,7 +59,7 @@ conn = snowflake.connector.connect(
 )
 cursor = conn.cursor()
 
-# RAW TABLE SETUP
+# Step 4: Create RAW table if not exists
 cursor.execute(f"USE DATABASE {database}")
 cursor.execute(f"USE SCHEMA {raw_schema}")
 cursor.execute(f"""
@@ -70,19 +70,18 @@ cursor.execute(f"""
     );
 """)
 
-# Insert raw JSON into RAW table
+# Step 5: Insert raw JSON records
 for record in data:
     country = record.get("country", "UNKNOWN")
-    json_text = json.dumps(record).replace("'", "''")  # escape quotes
+    json_text = json.dumps(record).replace("'", "''")  # Escape quotes for SQL
     insert_sql = f"""
         INSERT INTO {raw_schema}.{raw_table} (country, source_record)
         SELECT '{country}', PARSE_JSON('{json_text}')
     """
     cursor.execute(insert_sql)
-
 print(f"✅ Inserted {len(data)} rows into {raw_schema}.{raw_table}")
 
-# STAGING TABLE SETUP
+# Step 6: Setup STAGING table
 cursor.execute(f"USE SCHEMA {stg_schema}")
 try:
     cursor.execute(f"DESCRIBE TABLE {stg_table}")
@@ -97,7 +96,7 @@ except snowflake.connector.errors.ProgrammingError:
     existing_cols = set([k.replace(".", "_").lower() for k in full_schema])
     print(f"✅ Created table: {stg_schema}.{stg_table}")
 
-# Add any missing columns to staging
+# Step 7: Add missing columns if any
 for key, dtype in full_schema.items():
     col_name = key.replace(".", "_").lower()
     if col_name not in existing_cols:
@@ -105,7 +104,7 @@ for key, dtype in full_schema.items():
         cursor.execute(alter_sql)
         print(f"➕ Added column: {col_name} ({dtype})")
 
-# INSERT into staging table
+# Step 8: Insert flattened data into STAGING
 for record in data:
     flat_record = flatten_json(record)
     col_names = []
@@ -121,16 +120,26 @@ for record in data:
         elif dtype in ["STRING", "VARIANT"]:
             escaped_value = str(value).replace("'", "''")
             col_values.append(f"'{escaped_value}'")
+        elif dtype == "BOOLEAN":
+            col_values.append(str(value).upper())
+        elif dtype in ["NUMBER", "FLOAT"]:
+            try:
+                col_values.append(str(float(value)))
+            except:
+                col_values.append("NULL")
         else:
-            col_values.append(str(value))
+            col_values.append(f"'{str(value).replace(\"'\", \"''\")}'")
 
-    insert_stmt = f"""
-        INSERT INTO {stg_schema}.{stg_table} ({', '.join(col_names)})
-        VALUES ({', '.join(col_values)});
-    """
-    cursor.execute(insert_stmt)
+    try:
+        insert_stmt = f"""
+            INSERT INTO {stg_schema}.{stg_table} ({', '.join(col_names)})
+            VALUES ({', '.join(col_values)});
+        """
+        cursor.execute(insert_stmt)
+    except Exception as e:
+        print(f"❌ Failed to insert record: {e}")
 
-print(f"✅ Inserted {len(data)} rows into {stg_schema}.{stg_table}")
+print(f"✅ Inserted {len(data)} flattened rows into {stg_schema}.{stg_table}")
 
 # Cleanup
 cursor.close()
