@@ -4,10 +4,10 @@ import os
 from dotenv import load_dotenv
 import snowflake.connector
 
-# Load credentials
+# Load environment variables from .env file
 load_dotenv()
 
-# Helper: Infer Snowflake-compatible types
+# Infer Snowflake-compatible types
 def infer_type(value):
     if isinstance(value, int): return "NUMBER"
     if isinstance(value, float): return "FLOAT"
@@ -18,7 +18,7 @@ def infer_type(value):
     if isinstance(value, list): return "ARRAY"
     return "STRING"
 
-# Helper: Flatten nested JSON
+# Flatten nested JSON
 def flatten_json(json_obj, prefix=''):
     fields = {}
     for key, value in json_obj.items():
@@ -29,19 +29,19 @@ def flatten_json(json_obj, prefix=''):
             fields[full_key] = infer_type(value)
     return fields
 
-# Config
+# Configs
 database = "covid"
 raw_schema = "raw3"
 stg_schema = "stg"
 raw_table = "COVID_COUNTRY_RAW"
 stg_table = "COVID_COUNTRY_STG"
 
-# Step 1: Fetch 10 COVID records
+# Fetch COVID API data (10 records)
 url = "https://disease.sh/v3/covid-19/countries"
 response = requests.get(url)
 data = response.json()[:10]
 
-# Flatten schema
+# Build full schema by flattening
 full_schema = {}
 for record in data:
     flat = flatten_json(record)
@@ -59,7 +59,7 @@ conn = snowflake.connector.connect(
 )
 cursor = conn.cursor()
 
-# RAW: Create table if not exists
+# RAW TABLE SETUP
 cursor.execute(f"USE DATABASE {database}")
 cursor.execute(f"USE SCHEMA {raw_schema}")
 cursor.execute(f"""
@@ -70,18 +70,19 @@ cursor.execute(f"""
     );
 """)
 
-# Insert raw data into RAW table
+# Insert raw JSON into RAW table
 for record in data:
     country = record.get("country", "UNKNOWN")
-    json_text = json.dumps(record).replace("'", "''")
+    json_text = json.dumps(record).replace("'", "''")  # escape quotes
     insert_sql = f"""
         INSERT INTO {raw_schema}.{raw_table} (country, source_record)
         SELECT '{country}', PARSE_JSON('{json_text}')
     """
     cursor.execute(insert_sql)
+
 print(f"✅ Inserted {len(data)} rows into {raw_schema}.{raw_table}")
 
-# STAGING: Create or update table
+# STAGING TABLE SETUP
 cursor.execute(f"USE SCHEMA {stg_schema}")
 try:
     cursor.execute(f"DESCRIBE TABLE {stg_table}")
@@ -96,7 +97,7 @@ except snowflake.connector.errors.ProgrammingError:
     existing_cols = set([k.replace(".", "_").lower() for k in full_schema])
     print(f"✅ Created table: {stg_schema}.{stg_table}")
 
-# Alter table with any new fields
+# Add any missing columns to staging
 for key, dtype in full_schema.items():
     col_name = key.replace(".", "_").lower()
     if col_name not in existing_cols:
@@ -104,7 +105,7 @@ for key, dtype in full_schema.items():
         cursor.execute(alter_sql)
         print(f"➕ Added column: {col_name} ({dtype})")
 
-# INSERT flattened data into STG
+# INSERT into staging table
 for record in data:
     flat_record = flatten_json(record)
     col_names = []
@@ -114,10 +115,12 @@ for record in data:
         col = k.replace(".", "_").lower()
         col_names.append(f'"{col}"')
         value = flat_record.get(k)
+
         if value is None:
             col_values.append("NULL")
         elif dtype in ["STRING", "VARIANT"]:
-            col_values.append(f"'{str(value).replace(\"'\", \"''\")}'")
+            escaped_value = str(value).replace("'", "''")
+            col_values.append(f"'{escaped_value}'")
         else:
             col_values.append(str(value))
 
@@ -127,7 +130,7 @@ for record in data:
     """
     cursor.execute(insert_stmt)
 
-print(f"✅ Inserted {len(data)} flattened rows into {stg_schema}.{stg_table}")
+print(f"✅ Inserted {len(data)} rows into {stg_schema}.{stg_table}")
 
 # Cleanup
 cursor.close()
