@@ -65,7 +65,7 @@ for record in data:
         """, (country, json_str, fingerprint, load_ts, source_name))
         new_rows += 1
 
-print(f"✅ Inserted {new_rows} new records into {raw_schema}.{raw_table}")
+print(f"Inserted {new_rows} new records into {raw_schema}.{raw_table}")
 
 # ░░ Step 4: Call Snowflake Stored Procedure to Flatten + Archive
 cursor.execute(f"""
@@ -79,8 +79,8 @@ cursor.execute(f"""
     VALUES (%s, %s, %s, %s, %s)
 """, (load_ts, raw_table, new_rows, len(data) - new_rows, source_name))
 
-print("📦 Archival and flattening logic executed.")
-print(f"🗓️  Logged audit for load timestamp: {load_ts}")
+print("Archival and flattening logic executed.")
+print(f"Logged audit for load timestamp: {load_ts}")
 
 # ░░ Close connection
 cursor.close()
