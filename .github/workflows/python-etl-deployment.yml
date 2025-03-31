@@ -1,0 +1,33 @@
+name: Python ETL Deployment
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Run unit tests
+      run: |
+        python -m unittest discover -s tests
+
+    - name: Docker build and push
+      run: |
+        docker build -t brooke/snowflake-etl:latest .
+        docker tag brooke/snowflake-etl:latest docker.io/brooke/snowflake-etl:latest
+        echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+        docker push brooke/snowflake-etl:latest

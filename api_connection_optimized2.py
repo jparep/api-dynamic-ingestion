@@ -1,1253 +1,1571 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-
+#!/usr/bin/env python3
 """
-Snowflake Data Ingestion with Python - Optimized for March 2025 Snowflake Environment
+COVID-19 Data Pipeline - Enhanced Python Client
 Created: March 2025
 Last Updated: March 30, 2025
 
-This script extracts data from a source (API/files) and loads it into Snowflake,
-implementing complementary functionality to the existing Snowflake stored procedures.
-It's designed to work with the enhanced COVID Data Pipeline infrastructure in Snowflake,
-interfacing with the data quality framework, archive processes, and monitoring systems.
+This script runs on a local machine and handles all dynamic processing
+that was previously in JavaScript UDFs within Snowflake. It interacts directly
+with the disease.sh API to fetch COVID data and handles schema discovery,
+flattening, and view creation - all from the local machine.
+
+Requirements:
+- Python 3.8+
+- snowflake-connector-python
+- requests
+- python-dotenv
+- pandas
 """
 
 import os
+import sys
 import json
+import time
 import hashlib
-import uuid
-import datetime
-import re
-import pandas as pd
-import snowflake.connector
-from snowflake.connector.pandas_tools import write_pandas
-from typing import Dict, List, Any, Optional, Set, Tuple
-from dotenv import load_dotenv
-import requests
 import logging
 import argparse
-import sys
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import re
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Any, Optional, Union, Tuple, Set
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("snowflake_ingest.log"),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
+import requests
+import pandas as pd
+from dotenv import load_dotenv
+import snowflake.connector
+from snowflake.connector.pandas_tools import write_pandas
 
 # Load environment variables
 load_dotenv()
 
-# Snowflake connection parameters
-SNOWFLAKE_ACCOUNT = os.getenv('SNOWFLAKE_ACCOUNT')
-SNOWFLAKE_USER = os.getenv('SNOWFLAKE_USER')
-SNOWFLAKE_PASSWORD = os.getenv('SNOWFLAKE_PASSWORD')
-SNOWFLAKE_ROLE = os.getenv('SNOWFLAKE_ROLE', 'SYSADMIN')
-SNOWFLAKE_WAREHOUSE = os.getenv('SNOWFLAKE_WAREHOUSE', 'COMPUTE_WH')
-SNOWFLAKE_DATABASE = os.getenv('SNOWFLAKE_DATABASE', 'COVID')
+# Configure logging
+logging.basicConfig(
+    level=os.getenv('LOG_LEVEL', 'INFO'),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(f"logs/covid_pipeline_{datetime.now().strftime('%Y%m%d')}.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger('covid_pipeline')
 
-# Configure sensitive data patterns for PHI detection
-PHI_PATTERNS = [
-    r'\d{3}-\d{2}-\d{4}',                              # SSN
-    r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', # Email
-    r'\(\d{3}\)\s*\d{3}-\d{4}',                        # Phone (xxx) xxx-xxxx
-    r'\d{3}-\d{3}-\d{4}',                              # Phone xxx-xxx-xxxx
-    r'\d{4}[\s-]\d{4}[\s-]\d{4}[\s-]\d{4}',            # Credit card
-    r'\d{1,2}/\d{1,2}/\d{4}'                           # Date of birth
-]
+# Snowflake connection configuration
+SNOWFLAKE_CONFIG = {
+    'account': os.getenv('SNOWFLAKE_ACCOUNT'),
+    'user': os.getenv('SNOWFLAKE_USERNAME'),
+    'password': os.getenv('SNOWFLAKE_PASSWORD'),
+    'warehouse': os.getenv('SNOWFLAKE_WAREHOUSE', 'compute_wh'),
+    'database': os.getenv('SNOWFLAKE_DATABASE', 'covid'),
+    'schema': os.getenv('SNOWFLAKE_SCHEMA', 'raw'),
+    'role': os.getenv('SNOWFLAKE_ROLE', 'sysadmin')
+}
 
-class SnowflakeIngestion:
-    """Class to handle data extraction and ingestion into Snowflake"""
+# External COVID API configuration
+COVID_API_ENDPOINT = os.getenv('COVID_API_ENDPOINT', 'https://disease.sh/v3/covid-19')
+SOURCE_NAME = 'disease.sh'  # Source identifier
+
+
+class SnowflakeClient:
+    """Client for interacting with Snowflake"""
     
-    def __init__(self):
-        """Initialize the Snowflake connection"""
-        self.conn = snowflake.connector.connect(
-            user=SNOWFLAKE_USER,
-            password=SNOWFLAKE_PASSWORD,
-            account=SNOWFLAKE_ACCOUNT,
-            role=SNOWFLAKE_ROLE,
-            warehouse=SNOWFLAKE_WAREHOUSE,
-            database=SNOWFLAKE_DATABASE
-        )
-        self.cursor = self.conn.cursor()
-        logger.info(f"Connected to Snowflake: {SNOWFLAKE_DATABASE}")
-        
-        # Check tables exist and run validation
-        self._validate_snowflake_environment()
-        
-    def __del__(self):
-        """Close connection when object is destroyed"""
-        if hasattr(self, 'cursor') and self.cursor:
-            self.cursor.close()
-        if hasattr(self, 'conn') and self.conn:
-            self.conn.close()
-            logger.info("Snowflake connection closed")
-            
-    def _validate_snowflake_environment(self):
-        """Validate that required Snowflake objects exist"""
+    def __init__(self, config: Dict[str, str]):
+        """Initialize Snowflake connection"""
+        self.config = config
+        self.conn = None
+        self.connect()
+    
+    def connect(self) -> None:
+        """Establish connection to Snowflake"""
         try:
-            # Check required schemas
-            schemas = ['RAW3', 'STG', 'META', 'QUALITY', 'ARCHIVE']
-            for schema in schemas:
-                result = self.execute_query(f"SELECT COUNT(*) as count FROM information_schema.schemata WHERE schema_name = '{schema}'")
-                if result[0]['COUNT'] == 0:
-                    logger.warning(f"Schema {schema} does not exist in database {SNOWFLAKE_DATABASE}")
-            
-            # Check required tables
-            tables = {
-                'RAW3': ['COVID_COUNTRY_RAW'],
-                'STG': ['COVID_COUNTRY_STG'],
-                'META': ['INGEST_AUDIT_LOG', 'PERFORMANCE_METRICS', 'SCHEMA_CHANGE_LOG'],
-                'QUALITY': ['DATA_QUALITY_RULES', 'DATA_QUALITY_RESULTS'],
-                'ARCHIVE': ['COVID_COUNTRY_ARCHIVE', 'COVID_COUNTRY_RAW_ARCHIVE']
-            }
-            
-            for schema, schema_tables in tables.items():
-                for table in schema_tables:
-                    result = self.execute_query(
-                        f"SELECT COUNT(*) as count FROM information_schema.tables WHERE table_schema = '{schema}' AND table_name = '{table}'"
-                    )
-                    if result[0]['COUNT'] == 0:
-                        logger.warning(f"Table {schema}.{table} does not exist")
-            
-            # Check data quality rules exist
-            result = self.execute_query("SELECT COUNT(*) as count FROM quality.DATA_QUALITY_RULES")
-            if result[0]['COUNT'] == 0:
-                logger.warning("No data quality rules defined in quality.DATA_QUALITY_RULES")
-                
-            logger.info("Snowflake environment validation completed")
-        except Exception as e:
-            logger.error(f"Error validating Snowflake environment: {str(e)}")
-            # Non-fatal error - continue execution
-            
-    def execute_query(self, query: str, params: tuple = None) -> List[Dict]:
-        """Execute a query and return results as a list of dictionaries"""
+            self.conn = snowflake.connector.connect(
+                user=self.config['user'],
+                password=self.config['password'],
+                account=self.config['account'],
+                warehouse=self.config['warehouse'],
+                database=self.config['database'],
+                schema=self.config['schema'],
+                role=self.config['role']
+            )
+            logger.info("Successfully connected to Snowflake!")
+        except snowflake.connector.errors.DatabaseError as e:
+            logger.error(f"Error connecting to Snowflake: {e}")
+            sys.exit(1)
+    
+    def execute_query(self, query: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """Execute a SQL query and return results"""
         try:
+            cursor = self.conn.cursor(snowflake.connector.DictCursor)
             if params:
-                self.cursor.execute(query, params)
+                cursor.execute(query, params)
             else:
-                self.cursor.execute(query)
-                
-            if self.cursor.description:
-                columns = [col[0] for col in self.cursor.description]
-                return [dict(zip(columns, row)) for row in self.cursor.fetchall()]
-            return []
-        except Exception as e:
-            logger.error(f"Query execution error: {str(e)}")
-            logger.error(f"Query: {query}")
-            if params:
-                logger.error(f"Params: {params}")
-            raise
+                cursor.execute(query)
             
-    def fetch_json_data(self, url: str) -> List[Dict]:
-        """Fetch JSON data from an API endpoint"""
-        try:
-            response = requests.get(url, timeout=30)
-            response.raise_for_status()
-            
-            # Log the API response
-            logger.info(f"API Response: {response.status_code} from {url}")
-            
-            # Parse JSON response
-            data = response.json()
-            
-            # If the response is a dictionary, convert to list
-            if isinstance(data, dict):
-                if 'results' in data:
-                    return data['results']
-                elif 'data' in data:
-                    return data['data']
-                else:
-                    return [data]
-            
-            return data
-        except Exception as e:
-            logger.error(f"Error fetching data from {url}: {str(e)}")
-            raise
-            
-    def read_json_file(self, file_path: str) -> List[Dict]:
-        """Read data from a local JSON file"""
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                
-            # If the data is a dictionary, convert to list
-            if isinstance(data, dict):
-                if 'results' in data:
-                    return data['results']
-                elif 'data' in data:
-                    return data['data']
-                else:
-                    return [data]
-                    
-            return data
-        except Exception as e:
-            logger.error(f"Error reading file {file_path}: {str(e)}")
+            results = cursor.fetchall()
+            cursor.close()
+            return results
+        except snowflake.connector.errors.DatabaseError as e:
+            logger.error(f"Error executing SQL query: {e}")
+            logger.debug(f"Query: {query}")
+            logger.debug(f"Params: {params}")
             raise
     
-    def generate_record_hash(self, record: Dict) -> str:
-        """Generate a hash for deduplication"""
-        record_str = json.dumps(record, sort_keys=True)
-        return hashlib.md5(record_str.encode('utf-8')).hexdigest()
-        
-    def detect_phi(self, record: Dict) -> bool:
-        """Detect if a record contains PHI (Protected Health Information)"""
-        record_str = json.dumps(record)
-        
-        for pattern in PHI_PATTERNS:
-            if re.search(pattern, record_str):
-                return True
-                
-        return False
-        
-    def discover_schema(self, records: List[Dict], source_name: str, source_table: str) -> Dict:
-        """
-        Analyze records to discover schema structure and data types.
-        Similar to the Snowflake JavaScript UDF but running locally.
-        """
-        start_time = datetime.datetime.now()
-        logger.info(f"Starting schema discovery for {source_name}.{source_table}")
-        
-        column_map = {}
-        
-        # Extract fields and data types from records
-        for record in records:
-            self._extract_fields(record, column_map)
-            
-        # Convert results to schema definition
-        schema_definition = {}
-        for field, info in column_map.items():
-            # Determine most specific type
-            data_type = 'VARIANT'
-            types = list(info['types'])
-            
-            if 'NUMBER' in types:
-                data_type = 'NUMBER'
-            elif 'STRING' in types:
-                data_type = 'STRING'
-            elif 'BOOLEAN' in types:
-                data_type = 'BOOLEAN'
-            elif 'ARRAY' in types:
-                data_type = 'ARRAY'
-                
-            schema_definition[field] = {
-                'dataType': data_type,
-                'frequency': info['count'] / len(records),
-                'example': info['example']
-            }
-        
-        # Check for existing schema
-        existing_schema = self._check_existing_schema(source_name, source_table)
-        
-        if existing_schema:
-            # Update existing schema
-            schema_id = existing_schema['schema_id']
-            existing_schema_def = json.loads(existing_schema['schema_definition']) 
-            
-            # Compare and log schema changes
-            existing_fields = set(existing_schema_def.keys())
-            new_fields = set(schema_definition.keys())
-            
-            # Find added/updated/removed fields
-            added_fields = new_fields - existing_fields
-            removed_fields = existing_fields - new_fields
-            
-            # Find updated fields (type changes)
-            updated_fields = set()
-            for field in new_fields.intersection(existing_fields):
-                if existing_schema_def[field]['dataType'] != schema_definition[field]['dataType']:
-                    updated_fields.add(field)
-            
-            if added_fields or updated_fields or removed_fields:
-                # Set current schema as inactive
-                self.execute_query(
-                    "UPDATE meta.SOURCE_SCHEMA_REGISTRY SET is_current = FALSE, last_updated = CURRENT_TIMESTAMP() WHERE schema_id = %s",
-                    (schema_id,)
-                )
-                
-                # Insert new schema version
-                new_schema_sql = """
-                INSERT INTO meta.SOURCE_SCHEMA_REGISTRY 
-                (source_name, source_table, schema_definition, is_current)
-                VALUES (%s, %s, %s, TRUE)
-                """
-                new_schema_id = self.execute_query(
-                    new_schema_sql,
-                    (source_name, source_table, json.dumps(schema_definition))
-                )[0]['SCHEMA_ID']
-                
-                # Log schema changes
-                self._log_schema_changes(new_schema_id, source_table, schema_definition, 
-                                        added_fields, updated_fields, removed_fields, 
-                                        existing_schema_def)
-                
-                logger.info(f"Schema updated with {len(added_fields)} added, {len(updated_fields)} updated, "
-                           f"and {len(removed_fields)} removed fields")
-                return {
-                    "status": "UPDATED",
-                    "message": "Schema updated with changes detected",
-                    "added_fields": list(added_fields),
-                    "updated_fields": list(updated_fields),
-                    "removed_fields": list(removed_fields),
-                    "schema_id": new_schema_id
-                }
-            else:
-                logger.info("Schema analyzed and no changes detected")
-                return {
-                    "status": "UNCHANGED",
-                    "message": "Schema analyzed and no changes detected",
-                    "schema_id": schema_id
-                }
-        else:
-            # Insert new schema
-            new_schema_sql = """
-            INSERT INTO meta.SOURCE_SCHEMA_REGISTRY 
-            (source_name, source_table, schema_definition, is_current)
-            VALUES (%s, %s, %s, TRUE)
-            """
-            schema_id = self.execute_query(
-                new_schema_sql,
-                (source_name, source_table, json.dumps(schema_definition))
-            )[0]['SCHEMA_ID']
-            
-            # Create initial column mappings
-            for field, info in schema_definition.items():
-                target_column = field.replace('.', '_').lower()
-                data_type = info['dataType']
-                
-                mapping_sql = """
-                INSERT INTO meta.COLUMN_MAPPING 
-                (schema_id, source_column, target_column, data_type, transformation_rule, is_sensitive)
-                VALUES (%s, %s, %s, %s, %s, FALSE)
-                """
-                self.execute_query(
-                    mapping_sql,
-                    (schema_id, field, target_column, data_type, f"source_record:{field}::{data_type}")
-                )
-            
-            logger.info(f"New schema discovered with {len(schema_definition)} fields")
-            return {
-                "status": "CREATED",
-                "message": "New schema discovered and registered",
-                "field_count": len(schema_definition),
-                "schema_id": schema_id
-            }
-    
-    def _extract_fields(self, obj: Any, column_map: Dict, prefix: str = '') -> None:
-        """Recursively extract fields and their data types from a nested object"""
-        if not isinstance(obj, dict):
-            return
-            
-        for key, value in obj.items():
-            full_key = f"{prefix}.{key}" if prefix else key
-            
-            if value is None:
-                # Handle null values
-                if full_key not in column_map:
-                    column_map[full_key] = {
-                        'count': 1,
-                        'types': {'NULL'},
-                        'example': None
-                    }
-                else:
-                    column_map[full_key]['count'] += 1
-                    column_map[full_key]['types'].add('NULL')
-            elif isinstance(value, dict):
-                # Handle nested objects
-                if full_key not in column_map:
-                    column_map[full_key] = {
-                        'count': 1,
-                        'types': {'OBJECT'},
-                        'example': 'nested-object'
-                    }
-                else:
-                    column_map[full_key]['count'] += 1
-                    column_map[full_key]['types'].add('OBJECT')
-                self._extract_fields(value, column_map, full_key)
-            elif isinstance(value, list):
-                # Handle arrays
-                if full_key not in column_map:
-                    column_map[full_key] = {
-                        'count': 1,
-                        'types': {'ARRAY'},
-                        'example': value[:2] if value else []
-                    }
-                else:
-                    column_map[full_key]['count'] += 1
-                    column_map[full_key]['types'].add('ARRAY')
-            else:
-                # Handle primitive types
-                type_name = type(value).__name__.upper()
-                if type_name == 'INT' or type_name == 'FLOAT':
-                    type_name = 'NUMBER'
-                elif type_name == 'STR':
-                    type_name = 'STRING'
-                elif type_name == 'BOOL':
-                    type_name = 'BOOLEAN'
-                
-                if full_key not in column_map:
-                    column_map[full_key] = {
-                        'count': 1,
-                        'types': {type_name},
-                        'example': value
-                    }
-                else:
-                    column_map[full_key]['count'] += 1
-                    column_map[full_key]['types'].add(type_name)
-    
-    def _check_existing_schema(self, source_name: str, source_table: str) -> Optional[Dict]:
-        """Check if a schema already exists for the source/table"""
-        query = """
-        SELECT schema_id, schema_definition
-        FROM meta.SOURCE_SCHEMA_REGISTRY
-        WHERE source_name = %s
-        AND source_table = %s
-        AND is_current = TRUE
-        """
-        results = self.execute_query(query, (source_name, source_table))
-        return results[0] if results else None
-    
-    def _log_schema_changes(self, schema_id: int, table_name: str, 
-                           schema_definition: Dict, added_fields: Set[str],
-                           updated_fields: Set[str], removed_fields: Set[str],
-                           existing_schema: Dict) -> None:
-        """Log schema changes to the metadata tracking tables"""
-        # Log added fields
-        for field in added_fields:
-            add_sql = """
-            INSERT INTO meta.SCHEMA_CHANGE_LOG 
-            (schema_id, column_name, data_type, table_name, change_type)
-            VALUES (%s, %s, %s, %s, 'ADDED')
-            """
-            self.execute_query(
-                add_sql,
-                (schema_id, field, schema_definition[field]['dataType'], table_name)
-            )
-            
-            # Add to column mapping
-            map_sql = """
-            INSERT INTO meta.COLUMN_MAPPING 
-            (schema_id, source_column, target_column, data_type, transformation_rule, is_sensitive)
-            VALUES (%s, %s, %s, %s, %s, FALSE)
-            """
-            target_column = field.replace('.', '_').lower()
-            data_type = schema_definition[field]['dataType']
-            self.execute_query(
-                map_sql,
-                (schema_id, field, target_column, data_type, f"source_record:{field}::{data_type}")
-            )
-        
-        # Log updated fields
-        for field in updated_fields:
-            mod_sql = """
-            INSERT INTO meta.SCHEMA_CHANGE_LOG 
-            (schema_id, column_name, data_type, table_name, change_type)
-            VALUES (%s, %s, %s, %s, 'MODIFIED')
-            """
-            self.execute_query(
-                mod_sql,
-                (schema_id, field, schema_definition[field]['dataType'], table_name)
-            )
-            
-            # Update column mapping
-            update_sql = """
-            UPDATE meta.COLUMN_MAPPING
-            SET data_type = %s,
-                transformation_rule = %s,
-                last_updated = CURRENT_TIMESTAMP()
-            WHERE schema_id = %s
-            AND source_column = %s
-            """
-            data_type = schema_definition[field]['dataType']
-            self.execute_query(
-                update_sql,
-                (data_type, f"source_record:{field}::{data_type}", schema_id, field)
-            )
-        
-        # Log removed fields
-        for field in removed_fields:
-            rem_sql = """
-            INSERT INTO meta.SCHEMA_CHANGE_LOG 
-            (schema_id, column_name, data_type, table_name, change_type)
-            VALUES (%s, %s, %s, %s, 'REMOVED')
-            """
-            self.execute_query(
-                rem_sql,
-                (schema_id, field, existing_schema[field]['dataType'], table_name)
-            )
-    
-    def ingest_to_raw_table(self, records: List[Dict], source_name: str, source_table: str, api_endpoint: str = None) -> Dict:
-        """Ingest records into the raw3.COVID_COUNTRY_RAW table"""
-        start_time = datetime.datetime.now()
-        logger.info(f"Starting ingestion of {len(records)} records to raw3.COVID_COUNTRY_RAW")
-        
-        load_ts = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
-        batch_id = str(uuid.uuid4())
-        
-        # Create dataframe for loading
-        raw_records = []
-        
-        for record in records:
-            # Generate record hash for deduplication
-            record_hash = self.generate_record_hash(record)
-            
-            # Extract country (if available)
-            country = record.get('country', record.get('Country', record.get('location', record.get('Location', 'unknown'))))
-            
-            # Prepare record for insertion - match the exact schema in Snowflake
-            raw_records.append({
-                'country': country,
-                'source_record': json.dumps(record),
-                'record_hash': record_hash,
-                'load_ts': load_ts,
-                'source': source_name,
-                'api_response_code': '200',
-                'api_endpoint': api_endpoint
-            })
-        
-        # Check for duplicates
-        existing_hashes = set()
-        if raw_records:
-            hash_list = [f"'{r['record_hash']}'" for r in raw_records]
-            query = f"""
-            SELECT record_hash 
-            FROM raw3.COVID_COUNTRY_RAW 
-            WHERE record_hash IN ({','.join(hash_list)})
-            """
-            results = self.execute_query(query)
-            existing_hashes = {r['RECORD_HASH'] for r in results}
-        
-        # Filter out duplicates
-        unique_records = [r for r in raw_records if r['record_hash'] not in existing_hashes]
-        duplicate_count = len(raw_records) - len(unique_records)
-        
-        if not unique_records:
-            logger.info(f"No new records to ingest, {duplicate_count} duplicates skipped")
-            return {
-                "status": "SUCCESS",
-                "message": "No new records to ingest",
-                "duplicates_skipped": duplicate_count,
-                "records_loaded": 0,
-                "batch_id": batch_id,
-                "load_ts": load_ts
-            }
-        
-        # Convert to DataFrame for bulk loading
-        df = pd.DataFrame(unique_records)
-        
-        # Use Snowflake's write_pandas for efficient loading with type hints to match schema
-        success, num_chunks, num_rows, _ = write_pandas(
-            conn=self.conn,
-            df=df,
-            table_name='COVID_COUNTRY_RAW',
-            schema='RAW3',
-            database=SNOWFLAKE_DATABASE,
-            quote_identifiers=False
-        )
-        
-        # Log ingestion in audit table
-        audit_sql = """
-        INSERT INTO meta.INGEST_AUDIT_LOG (
-            load_ts,
-            table_name,
-            record_count,
-            duplicates_skipped,
-            source,
-            process_name,
-            process_status,
-            execution_time_ms
-        )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        """
-        
-        self.execute_query(
-            audit_sql,
-            (
-                batch_load_ts,
-                source_table,
-                processed_count,
-                duplicate_count,
-                source_name,
-                'PYTHON_PROCESS_SCRIPT',
-                'COMPLETED_WITH_ERRORS' if error_count > 0 else 'SUCCESS',
-                execution_time
-            )
-        )
-        
-        # Record performance metrics
-        perf_sql = """
-        INSERT INTO meta.PERFORMANCE_METRICS (
-            process_name,
-            execution_time_ms,
-            rows_processed
-        )
-        VALUES (%s, %s, %s)
-        """
-        
-        self.execute_query(
-            perf_sql,
-            (
-                'PYTHON_PROCESS_SCRIPT',
-                execution_time,
-                processed_count
-            )
-        )
-        
-        logger.info(f"Processing complete: {processed_count} records processed, "
-                   f"{duplicate_count} duplicates skipped, {error_count} errors")
-                   
-        return {
-            "status": "SUCCESS",
-            "records_processed": processed_count,
-            "duplicates_skipped": duplicate_count,
-            "errors": error_count,
-            "execution_time_ms": execution_time,
-            "source": source_name,
-            "table": source_table,
-            "load_ts": batch_load_ts
-        }
-        
-    def _extract_value_from_path(self, obj: Dict, path: str) -> Any:
-        """Extract a value from a nested dictionary using a dot-notation path"""
-        keys = path.split('.')
-        value = obj
-        
-        for key in keys:
-            if isinstance(value, dict) and key in value:
-                value = value[key]
-            else:
-                return None
-                
-        return value
-    
-    def ensure_staging_table_exists(self, source_name: str, source_table: str) -> Dict:
-        """
-        Ensure the staging table exists for the given source/table.
-        Similar to meta.PROC_GENERATE_STAGING_TABLE
-        """
-        logger.info(f"Ensuring staging table exists for {source_name}.{source_table}")
-        
-        # Get schema ID
-        schema_query = """
-        SELECT schema_id
-        FROM meta.SOURCE_SCHEMA_REGISTRY
-        WHERE source_name = %s
-        AND source_table = %s
-        AND is_current = TRUE
-        """
-        
-        schema_results = self.execute_query(schema_query, (source_name, source_table))
-        
-        if not schema_results:
-            error_msg = f"No schema found for source: {source_name}, table: {source_table}"
-            logger.error(error_msg)
-            return {"status": "ERROR", "message": error_msg}
-            
-        schema_id = schema_results[0]['SCHEMA_ID']
-        
-        # Form staging table name
-        staging_table = f"stg.{source_table.replace('-', '_')}_STG"
-        
-        # Check if table exists
-        table_check_query = """
-        SELECT COUNT(*) as count
-        FROM information_schema.tables
-        WHERE table_schema = 'STG'
-        AND table_name = %s
-        """
-        
-        table_check_results = self.execute_query(
-            table_check_query, 
-            (source_table.replace('-', '_') + '_STG',)
-        )
-        
-        table_exists = table_check_results[0]['COUNT'] > 0
-        
-        # Get column mappings
-        mapping_query = """
-        SELECT target_column, data_type
-        FROM meta.COLUMN_MAPPING
-        WHERE schema_id = %s
-        AND enabled = TRUE
-        """
-        
-        mapping_results = self.execute_query(mapping_query, (schema_id,))
-        
-        # Generate column definitions
-        column_definitions = []
-        for row in mapping_results:
-            data_type = row['DATA_TYPE']
-            snowflake_type = 'VARIANT'
-            
-            if data_type == 'NUMBER':
-                snowflake_type = 'NUMBER'
-            elif data_type == 'STRING':
-                snowflake_type = 'STRING'
-            elif data_type == 'BOOLEAN':
-                snowflake_type = 'BOOLEAN'
-            
-            column_definitions.append(f"{row['TARGET_COLUMN']} {snowflake_type}")
-        
-        if not table_exists:
-            # Create new table
-            create_sql = f"""
-            CREATE TABLE {staging_table} (
-                stg_id NUMBER IDENTITY START 1 INCREMENT 1,
-                {', '.join(column_definitions)},
-                load_ts STRING NOT NULL,
-                source STRING NOT NULL,
-                source_table STRING NOT NULL,
-                raw_id NUMBER NOT NULL,
-                processed_timestamp TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP,
-                quality_check_passed BOOLEAN,
-                contains_phi BOOLEAN DEFAULT FALSE,
-                CONSTRAINT pk_{source_table.replace('-', '_')}_stg PRIMARY KEY (stg_id)
-            )
-            DATA_RETENTION_TIME_IN_DAYS = 14
-            CLUSTER BY (load_ts, country)
-            COMMENT = 'Dynamically generated staging table for {source_table}'
-            """
-            
-            self.execute_query(create_sql)
-            
-            logger.info(f"Created staging table {staging_table} with {len(column_definitions)} columns")
-            return {
-                "status": "CREATED",
-                "message": "Staging table created successfully",
-                "table_name": staging_table,
-                "column_count": len(column_definitions)
-            }
-        else:
-            # Get existing columns
-            columns_query = """
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_schema = 'STG'
-            AND table_name = %s
-            """
-            
-            columns_result = self.execute_query(
-                columns_query, 
-                (source_table.replace('-', '_') + '_STG',)
-            )
-            
-            existing_columns = {row['COLUMN_NAME'].upper() for row in columns_result}
-            
-            # Add missing columns
-            columns_added = 0
-            
-            for row in mapping_results:
-                target_column = row['TARGET_COLUMN'].upper()
-                
-                if target_column not in existing_columns:
-                    data_type = row['DATA_TYPE']
-                    snowflake_type = 'VARIANT'
-                    
-                    if data_type == 'NUMBER':
-                        snowflake_type = 'NUMBER'
-                    elif data_type == 'STRING':
-                        snowflake_type = 'STRING'
-                    elif data_type == 'BOOLEAN':
-                        snowflake_type = 'BOOLEAN'
-                    
-                    alter_sql = f"""
-                    ALTER TABLE {staging_table} 
-                    ADD COLUMN {row['TARGET_COLUMN']} {snowflake_type}
-                    """
-                    
-                    self.execute_query(alter_sql)
-                    columns_added += 1
-            
-            logger.info(f"Updated staging table {staging_table}, added {columns_added} new columns")
-            return {
-                "status": "UPDATED",
-                "message": "Staging table updated successfully",
-                "table_name": staging_table,
-                "columns_added": columns_added
-            }
-
-def main():
-    """Main function to run the ETL process - optimized for March 2025 Snowflake environment"""
-    try:
-        # Initialize Snowflake ingestion
-        ingest = SnowflakeIngestion()
-        
-        # Define source information
-        source_name = "JHU"  # Example source
-        source_table = "covid19-daily"  # Example table name
-        api_endpoint = "https://api.example.com/covid19/daily"  # Example API endpoint
-        
-        # Get command line arguments if available
-        parser = argparse.ArgumentParser(description='COVID-19 Data Ingestion Tool')
-        parser.add_argument('--source', help='Source name identifier')
-        parser.add_argument('--table', help='Source table identifier')
-        parser.add_argument('--api', help='API endpoint URL')
-        parser.add_argument('--file', help='Local file path for data')
-        parser.add_argument('--countries', help='Comma-separated list of countries to process')
-        parser.add_argument('--mode', choices=['full', 'extract_only', 'process_only'], 
-                            default='full', help='Processing mode')
-        args = parser.parse_args()
-        
-        # Override defaults with command line arguments if provided
-        if args.source:
-            source_name = args.source
-        if args.table:
-            source_table = args.table
-        if args.api:
-            api_endpoint = args.api
-        
-        # Select data source based on arguments and mode
-        if args.mode != 'process_only':
-            # Option 1: Fetch data from API
-            if not args.file:
-                try:
-                    logger.info(f"Fetching data from API: {api_endpoint}")
-                    
-                    # If specific countries requested, fetch only those
-                    if args.countries:
-                        countries = args.countries.split(',')
-                        all_records = []
-                        for country in countries:
-                            country_api = f"{api_endpoint}?country={country.strip()}"
-                            logger.info(f"Fetching data for country: {country} from {country_api}")
-                            country_records = ingest.fetch_json_data(country_api)
-                            all_records.extend(country_records)
-                        records = all_records
-                    else:
-                        records = ingest.fetch_json_data(api_endpoint)
-                        
-                except Exception as e:
-                    logger.error(f"Error fetching data from API: {str(e)}")
-                    # Fallback to local file if API fails
-                    file_path = args.file or "sample_covid_data.json"
-                    logger.info(f"Falling back to local file: {file_path}")
-                    records = ingest.read_json_file(file_path)
-            
-            # Option 2: Read from local JSON file
-            else:
-                file_path = args.file
-                logger.info(f"Reading data from local file: {file_path}")
-                records = ingest.read_json_file(file_path)
-            
-            logger.info(f"Read {len(records)} records from source")
-            
-            # Ingest data to raw table
-            ingest_result = ingest.ingest_to_raw_table(records, source_name, source_table, api_endpoint)
-            logger.info(f"Ingestion result: {ingest_result['status']}, {ingest_result['records_loaded']} records loaded")
-            
-            # If extract only mode, stop here
-            if args.mode == 'extract_only':
-                logger.info("Extract-only mode, skipping processing steps")
-                return
-                
-            load_ts = ingest_result['load_ts']
-        else:
-            # For process_only mode, use the most recent load_ts
-            latest_batch_query = """
-            SELECT MAX(load_ts) as latest_batch
-            FROM raw3.COVID_COUNTRY_RAW
-            WHERE source = %s
-            """
-            latest_batch = ingest.execute_query(latest_batch_query, (source_name,))
-            
-            if not latest_batch or not latest_batch[0]['LATEST_BATCH']:
-                logger.error("No data batches found for processing")
-                return
-                
-            load_ts = latest_batch[0]['LATEST_BATCH']
-            logger.info(f"Process-only mode, using most recent batch: {load_ts}")
-        
-        # Trigger Snowflake processing using the optimized procedures
-        process_result = ingest.trigger_snowflake_processing(load_ts, source_name)
-        logger.info(f"Snowflake processing result: {process_result}")
-        
-        # Trigger data quality checks
-        quality_result = ingest.trigger_quality_checks('stg.COVID_COUNTRY_STG', load_ts)
-        logger.info(f"Quality checks result: {quality_result}")
-        
-        # Check if any critical data quality issues
-        if quality_result.get('critical_failures', 0) > 0:
-            logger.warning(f"Critical data quality issues detected: {quality_result.get('critical_failures')} rules failed")
-            
-        logger.info("Data pipeline execution completed successfully")
-        
-    except Exception as e:
-        logger.error(f"Error in main execution: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
-
-def parallel_fetch_countries(api_base_url: str, countries: List[str], max_workers: int = 5) -> List[Dict]:
-    """Fetch data for multiple countries in parallel for improved performance"""
-    all_records = []
-    
-    logger.info(f"Fetching data for {len(countries)} countries in parallel")
-    
-    def fetch_country(country):
+    def execute_script(self, script: str) -> None:
+        """Execute a multi-statement SQL script"""
         try:
-            country_api = f"{api_base_url}?country={country.strip()}"
-            logger.info(f"Fetching data for country: {country}")
-            response = requests.get(country_api, timeout=30)
-            response.raise_for_status()
-            data = response.json()
-            
-            # If the response is a dictionary with a results/data key, extract the records
-            if isinstance(data, dict):
-                if 'results' in data:
-                    return data['results']
-                elif 'data' in data:
-                    return data['data']
-                else:
-                    return [data]
-            
-            return data
-        except Exception as e:
-            logger.error(f"Error fetching data for country {country}: {str(e)}")
-            return []
+            cursor = self.conn.cursor()
+            cursor.execute(script)
+            cursor.close()
+            logger.info("Successfully executed SQL script")
+        except snowflake.connector.errors.DatabaseError as e:
+            logger.error(f"Error executing SQL script: {e}")
+            raise
     
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_country = {executor.submit(fetch_country, country): country for country in countries}
-        
-        for future in as_completed(future_to_country):
-            country = future_to_country[future]
+    def execute_procedure(self, procedure: str, params: List[Any]) -> Dict[str, Any]:
+        """Execute a stored procedure and return results"""
+        try:
+            cursor = self.conn.cursor(snowflake.connector.DictCursor)
+            result = cursor.execute(f"CALL {procedure}({', '.join(['%s'] * len(params))})", params)
+            row = result.fetchone()
+            cursor.close()
+            return dict(row) if row else {}
+        except snowflake.connector.errors.DatabaseError as e:
+            logger.error(f"Error executing procedure {procedure}: {e}")
+            raise
+    
+    def close(self) -> None:
+        """Close Snowflake connection"""
+        if self.conn:
             try:
-                country_records = future.result()
-                if country_records:
-                    all_records.extend(country_records)
-                    logger.info(f"Added {len(country_records)} records for {country}")
-            except Exception as e:
-                logger.error(f"Exception processing country {country}: {str(e)}")
-    
-    logger.info(f"Parallel fetch completed: {len(all_records)} total records")
-    return all_records
+                self.conn.close()
+                logger.info("Snowflake connection closed.")
+            except:
+                pass
 
-if __name__ == "__main__":
-    main()
-.INGEST_AUDIT_LOG (
-            load_ts,
-            table_name,
-            record_count,
-            duplicates_skipped,
-            source,
-            process_name,
-            process_status,
-            execution_time_ms
-        )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        """
-        
-        execution_time = (datetime.datetime.now() - start_time).total_seconds() * 1000
-        self.execute_query(
-            audit_sql,
-            (
-                load_ts,
-                source_table,
-                len(unique_records),
-                duplicate_count,
-                source_name,
-                'PYTHON_INGEST_SCRIPT',
-                'SUCCESS' if success else 'ERROR',
-                execution_time
-            )
-        )
-        
-        logger.info(f"Ingestion complete: {len(unique_records)} records loaded, {duplicate_count} duplicates skipped")
-        return {
-            "status": "SUCCESS" if success else "ERROR",
-            "message": "Data ingested successfully" if success else "Error during ingestion",
-            "records_loaded": len(unique_records),
-            "duplicates_skipped": duplicate_count,
-            "batch_id": batch_id,
-            "load_ts": load_ts
+
+class CovidApiClient:
+    """Client for interacting with COVID-19 API"""
+    
+    def __init__(self, base_url: str):
+        """Initialize API client"""
+        self.base_url = base_url
+        self.headers = {
+            'User-Agent': 'Covid-Data-Pipeline/1.0 (compliance@example.org)',
+            'Accept': 'application/json'
         }
     
-    def trigger_snowflake_processing(self, load_ts: str, source: str) -> Dict:
-        """Trigger the Snowflake stored procedure to process and flatten data
+    def fetch_countries_data(self) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """Fetch COVID data for all countries and return with metadata"""
+        endpoint = f"{self.base_url}/countries"
+        logger.info(f"Fetching data from: {endpoint}")
         
-        This leverages the existing optimized Snowflake procedure rather than
-        duplicating the logic in Python
-        """
+        params = {}
         try:
-            logger.info(f"Triggering Snowflake stored procedure to process batch {load_ts}")
+            response = requests.get(endpoint, headers=self.headers, params=params)
+            response.raise_for_status()
+            data = response.json()
             
-            # Call the Snowflake procedure directly
-            query = f"""
-            CALL meta.PROC_FLATTEN_AND_ARCHIVE(
-                '{load_ts}',
-                '{source}',
-                12
-            )
-            """
-            
-            result = self.execute_query(query)
-            
-            logger.info(f"Snowflake processing completed: {result}")
-            return result[0]
-        except Exception as e:
-            logger.error(f"Error triggering Snowflake processing: {str(e)}")
-            return {
-                "status": "ERROR",
-                "message": f"Error: {str(e)}"
+            # Create metadata about this request
+            metadata = {
+                'endpoint': endpoint,
+                'params': params,
+                'status_code': response.status_code,
+                'timestamp': datetime.now().isoformat(),
+                'response_time_ms': response.elapsed.total_seconds() * 1000
             }
             
-    def trigger_quality_checks(self, table_name: str, load_ts: str) -> Dict:
-        """Trigger data quality checks in Snowflake
-        
-        Uses the existing quality.PROC_RUN_DATA_QUALITY_CHECKS procedure
-        """
-        try:
-            logger.info(f"Triggering data quality checks for {table_name}, batch {load_ts}")
-            
-            # Call the Snowflake quality check procedure
-            query = f"""
-            CALL quality.PROC_RUN_DATA_QUALITY_CHECKS(
-                '{table_name}',
-                '{load_ts}'
-            )
-            """
-            
-            result = self.execute_query(query)
-            
-            # Check for critical failures
-            critical_failures_query = """
-            SELECT COUNT(*) as count
-            FROM quality.DATA_QUALITY_RESULTS r
-            JOIN quality.DATA_QUALITY_RULES q ON r.rule_id = q.rule_id
-            WHERE r.load_ts = %s
-            AND r.status = 'FAILED'
-            AND q.severity = 'ERROR'
-            """
-            
-            critical_failures = self.execute_query(critical_failures_query, (load_ts,))
-            
-            if critical_failures[0]['COUNT'] > 0:
-                logger.error(f"Critical data quality issues detected: {critical_failures[0]['COUNT']} rules failed")
-                
-            return {
-                "status": "SUCCESS",
-                "quality_results": result[0],
-                "critical_failures": critical_failures[0]['COUNT']
-            }
-        except Exception as e:
-            logger.error(f"Error triggering quality checks: {str(e)}")
-            return {
-                "status": "ERROR",
-                "message": f"Error: {str(e)}"
-            }
+            logger.info(f"Successfully fetched data for {len(data)} countries")
+            return data, metadata
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error fetching COVID data: {e}")
+            raise
     
-    def process_raw_data(self, source_name: str, source_table: str, load_ts: str = None, batch_id: str = None, batch_size: int = 10000) -> Dict:
-        """Process raw data into the staging table"""
-        start_time = datetime.datetime.now()
-        logger.info(f"Starting processing of raw data for {source_name}.{source_table}")
+    def fetch_country_data(self, country: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Fetch COVID data for a specific country and return with metadata"""
+        endpoint = f"{self.base_url}/countries/{country}"
+        logger.info(f"Fetching data for country: {country}")
         
-        # Get schema and mapping information
-        schema_query = """
-        SELECT sr.schema_id, sr.schema_definition
-        FROM meta.SOURCE_SCHEMA_REGISTRY sr
-        WHERE sr.source_name = %s
-        AND sr.source_table = %s
-        AND sr.is_current = TRUE
-        """
-        schema_results = self.execute_query(schema_query, (source_name, source_table))
+        params = {}
+        try:
+            response = requests.get(endpoint, headers=self.headers, params=params)
+            response.raise_for_status()
+            data = response.json()
+            
+            # Create metadata about this request
+            metadata = {
+                'endpoint': endpoint,
+                'params': params,
+                'status_code': response.status_code,
+                'timestamp': datetime.now().isoformat(),
+                'response_time_ms': response.elapsed.total_seconds() * 1000
+            }
+            
+            logger.info(f"Successfully fetched data for {country}")
+            return data, metadata
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error fetching COVID data for {country}: {e}")
+            raise
+
+
+class SchemaDiscoveryHandler:
+    """Handler for schema discovery and registry"""
+    
+    def __init__(self, snowflake_client: SnowflakeClient):
+        self.snowflake = snowflake_client
+    
+    def discover_and_register_schema(self, source_name: str, load_ts: str) -> Dict[str, Any]:
+        """Discover schema from raw records and register fields"""
+        logger.info(f"Discovering schema for {source_name}, batch {load_ts}")
+        start_time = time.time()
         
-        if not schema_results:
-            error_msg = f"No schema found for source: {source_name}, table: {source_table}"
-            logger.error(error_msg)
-            return {"status": "ERROR", "message": error_msg}
-        
-        schema_id = schema_results[0]['SCHEMA_ID']
-        
-        # Get column mappings
-        mapping_query = """
-        SELECT source_column, target_column, data_type, transformation_rule
-        FROM meta.COLUMN_MAPPING
-        WHERE schema_id = %s
-        AND enabled = TRUE
-        """
-        mapping_results = self.execute_query(mapping_query, (schema_id,))
-        
-        if not mapping_results:
-            error_msg = f"No enabled column mappings found for schema ID: {schema_id}"
-            logger.error(error_msg)
-            return {"status": "ERROR", "message": error_msg}
-        
-        # Build column mappings structure
-        column_mappings = []
-        for row in mapping_results:
-            column_mappings.append({
-                'source': row['SOURCE_COLUMN'],
-                'target': row['TARGET_COLUMN'],
-                'dataType': row['DATA_TYPE'],
-                'transformation': row['TRANSFORMATION_RULE']
-            })
-        
-        # Determine staging table name
-        staging_table = f"stg.{source_table.replace('-', '_')}_STG"
-        
-        # Build WHERE clause for fetching records
-        where_clauses = [
-            f"source = '{source_name}'", 
-            f"source_table = '{source_table}'", 
-            "is_processed = FALSE"
-        ]
-        
-        if load_ts:
-            where_clauses.append(f"load_ts = '{load_ts}'")
-        
-        if batch_id:
-            where_clauses.append(f"incremental_batch_id = '{batch_id}'")
-        
-        where_clause = " AND ".join(where_clauses)
-        
-        # Get records to process - adjusted fields to match the March 2025 schema
-        records_query = f"""
-        SELECT raw_id, source_record, record_hash
-        FROM raw3.COVID_COUNTRY_RAW
-        WHERE {where_clause}
-        LIMIT {batch_size}
+        # Get sample records
+        query = """
+            SELECT source_record 
+            FROM raw.COVID_RAW
+            WHERE source_name = %(source_name)s
+            AND load_ts = %(load_ts)s
+            LIMIT 100
         """
         
-        raw_records = self.execute_query(records_query)
+        records = self.snowflake.execute_query(
+            query, 
+            {'source_name': source_name, 'load_ts': load_ts}
+        )
         
-        if not raw_records:
-            logger.info(f"No unprocessed records found for {source_name}.{source_table}")
+        if not records:
+            logger.warning(f"No records found for schema discovery. Source: {source_name}, Load TS: {load_ts}")
             return {
-                "status": "SUCCESS",
-                "message": "No unprocessed records found",
-                "records_processed": 0
+                'status': 'ERROR',
+                'message': 'No records found for schema discovery'
+            }
+        
+        # Process records to discover schema
+        discovered_fields = {}
+        
+        for record in records:
+            source_record = record['SOURCE_RECORD']
+            self._discover_schema(source_record, "", discovered_fields)
+        
+        # Register discovered fields
+        fields_registered = 0
+        
+        for field_path, field_info in discovered_fields.items():
+            self._register_field(
+                source_name=source_name,
+                field_name=field_info['name'],
+                field_path=field_path,
+                field_example=field_info['example'],
+                data_type=field_info['type'],
+                load_ts=load_ts
+            )
+            fields_registered += 1
+        
+        # Log the operation
+        execution_time_ms = int((time.time() - start_time) * 1000)
+        
+        self._log_operation(
+            operation_name='DISCOVER_AND_REGISTER_SCHEMA',
+            target_table='meta.SCHEMA_REGISTRY',
+            record_count=fields_registered,
+            source_name=source_name,
+            load_ts=load_ts,
+            status='SUCCESS',
+            execution_time_ms=execution_time_ms
+        )
+        
+        return {
+            'status': 'SUCCESS',
+            'message': f'Successfully discovered and registered schema',
+            'fields_discovered': fields_registered,
+            'execution_time_ms': execution_time_ms
+        }
+    
+    def _discover_schema(self, obj: Dict[str, Any], prefix: str, result: Dict[str, Dict[str, Any]]) -> None:
+        """Recursively discover schema from a JSON object"""
+        for key, value in obj.items():
+            path = f"{prefix}.{key}" if prefix else key
+            value_type = self._get_json_type(value)
+            
+            if value_type == 'object' and value is not None:
+                # Recursively process nested objects
+                self._discover_schema(value, path, result)
+            elif value_type == 'array' and value:
+                # For arrays, process each item type
+                if isinstance(value[0], dict):
+                    # Array of objects - append index to path
+                    for i, item in enumerate(value[:5]):  # Process up to 5 items
+                        self._discover_schema(item, f"{path}[{i}]", result)
+                else:
+                    # Array of primitives - just register the array itself
+                    result[path] = {
+                        'name': key,
+                        'type': 'ARRAY',
+                        'example': str(value)[:255]
+                    }
+            else:
+                # Register leaf node
+                result[path] = {
+                    'name': key,
+                    'type': value_type.upper(),
+                    'example': str(value)[:255] if value is not None else 'NULL'
+                }
+    
+    def _get_json_type(self, value: Any) -> str:
+        """Get JSON data type as string"""
+        if value is None:
+            return 'null'
+        
+        if isinstance(value, dict):
+            return 'object'
+        elif isinstance(value, list):
+            return 'array'
+        elif isinstance(value, bool):
+            return 'boolean'
+        elif isinstance(value, int):
+            return 'number'
+        elif isinstance(value, float):
+            return 'number'
+        else:
+            return 'string'
+    
+    def _register_field(self, source_name: str, field_name: str, field_path: str, 
+                       field_example: str, data_type: str, load_ts: str) -> None:
+        """Register a field in the schema registry"""
+        query = """
+            MERGE INTO meta.SCHEMA_REGISTRY target
+            USING (SELECT %(source_name)s as source_name, %(field_name)s as field_name, %(field_path)s as field_path) source
+            ON target.source_name = source.source_name AND target.field_path = source.field_path
+            WHEN MATCHED THEN
+                UPDATE SET 
+                    last_seen_ts = CURRENT_TIMESTAMP(),
+                    field_example = %(field_example)s,
+                    data_type = %(data_type)s,
+                    is_active = TRUE
+            WHEN NOT MATCHED THEN
+                INSERT (source_name, field_name, field_path, field_example, data_type, load_ts)
+                VALUES (%(source_name)s, %(field_name)s, %(field_path)s, %(field_example)s, %(data_type)s, %(load_ts)s)
+        """
+        
+        self.snowflake.execute_query(
+            query,
+            {
+                'source_name': source_name,
+                'field_name': field_name,
+                'field_path': field_path,
+                'field_example': field_example,
+                'data_type': data_type,
+                'load_ts': load_ts
+            }
+        )
+    
+    def _log_operation(self, operation_name: str, target_table: str, record_count: int,
+                     source_name: str, load_ts: str, status: str,
+                     error_message: Optional[str] = None, 
+                     execution_time_ms: Optional[int] = None) -> None:
+        """Log an operation to the audit log"""
+        query = """
+            CALL meta.LOG_OPERATION(
+                %(operation_name)s,
+                %(target_table)s,
+                %(record_count)s,
+                %(source_name)s,
+                %(load_ts)s,
+                %(status)s,
+                %(error_message)s,
+                %(execution_time_ms)s
+            )
+        """
+        
+        try:
+            self.snowflake.execute_query(
+                query,
+                {
+                    'operation_name': operation_name,
+                    'target_table': target_table,
+                    'record_count': record_count,
+                    'source_name': source_name,
+                    'load_ts': load_ts,
+                    'status': status,
+                    'error_message': error_message,
+                    'execution_time_ms': execution_time_ms
+                }
+            )
+        except Exception as e:
+            logger.error(f"Failed to log operation: {e}")
+
+
+class DataFlatteningHandler:
+    """Handler for flattening JSON data to staging tables"""
+    
+    def __init__(self, snowflake_client: SnowflakeClient, schema_handler: SchemaDiscoveryHandler):
+        self.snowflake = snowflake_client
+        self.schema_handler = schema_handler
+    
+    def flatten_json_to_staging(self, source_name: str, load_ts: str) -> Dict[str, Any]:
+        """Process raw records and flatten to staging table"""
+        logger.info(f"Flattening JSON data for {source_name}, batch {load_ts}")
+        start_time = time.time()
+        
+        # First ensure schema is discovered and registered
+        self.schema_handler.discover_and_register_schema(source_name, load_ts)
+        
+        # Get raw records to flatten
+        query = """
+            SELECT 
+                raw_id, source_name, entity_id, source_record, record_hash, load_ts
+            FROM raw.COVID_RAW
+            WHERE source_name = %(source_name)s
+            AND load_ts = %(load_ts)s
+        """
+        
+        records = self.snowflake.execute_query(
+            query,
+            {'source_name': source_name, 'load_ts': load_ts}
+        )
+        
+        if not records:
+            logger.warning(f"No records found to flatten. Source: {source_name}, Load TS: {load_ts}")
+            return {
+                'status': 'WARNING',
+                'message': 'No records found to flatten'
             }
         
         # Process each record
-        processed_count = 0
-        error_count = 0
-        duplicate_count = 0
+        record_count = 0
+        field_count = 0
         
-        batch_load_ts = load_ts or datetime.datetime.now().strftime('%Y%m%d%H%M%S')
-        
-        for record in raw_records:
+        for record in records:
             raw_id = record['RAW_ID']
+            entity_id = record['ENTITY_ID']
+            source_record = record['SOURCE_RECORD']
+            record_hash = record['RECORD_HASH']
+            record_load_ts = record['LOAD_TS']
             
-            try:
-                # Check for existing record to avoid duplicates
-                check_query = f"""
-                SELECT COUNT(*) as count
-                FROM {staging_table}
-                WHERE raw_id = {raw_id}
-                """
-                check_result = self.execute_query(check_query)
-                
-                if check_result[0]['COUNT'] > 0:
-                    duplicate_count += 1
-                    continue
-                
-                # Parse source record
-                source_record = json.loads(record['SOURCE_RECORD'])
-                
-                # Extract values using the transformation rules
-                values = {}
-                for mapping in column_mappings:
-                    source_path = mapping['source']
-                    target_column = mapping['target']
-                    
-                    # Extract value from nested JSON using path
-                    value = self._extract_value_from_path(source_record, source_path)
-                    
-                    # Apply data type conversion
-                    data_type = mapping['dataType']
-                    if data_type == 'NUMBER' and value is not None:
-                        try:
-                            value = float(value)
-                        except (ValueError, TypeError):
-                            value = None
-                    elif data_type == 'BOOLEAN' and value is not None:
-                        if isinstance(value, str):
-                            value = value.lower() in ('true', 'yes', '1')
+            # Flatten the JSON and insert fields
+            inserted_fields = self._flatten_and_insert_json(
+                raw_id=raw_id,
+                source_name=source_name,
+                entity_id=entity_id,
+                source_record=source_record,
+                record_hash=record_hash,
+                load_ts=record_load_ts
+            )
+            
+            record_count += 1
+            field_count += inserted_fields
+        
+        # Log the operation
+        execution_time_ms = int((time.time() - start_time) * 1000)
+        
+        self.schema_handler._log_operation(
+            operation_name='FLATTEN_JSON_TO_STAGING',
+            target_table='stg.COVID_STG',
+            record_count=record_count,
+            source_name=source_name,
+            load_ts=load_ts,
+            status='SUCCESS',
+            execution_time_ms=execution_time_ms
+        )
+        
+        # Log performance metrics
+        self._track_performance(
+            process_name='FLATTEN_JSON_TO_STAGING',
+            execution_time_ms=execution_time_ms,
+            rows_processed=record_count
+        )
+        
+        return {
+            'status': 'SUCCESS',
+            'message': f'Successfully flattened JSON data to staging',
+            'records_processed': record_count,
+            'fields_processed': field_count,
+            'execution_time_ms': execution_time_ms
+        }
+    
+    def _flatten_and_insert_json(self, raw_id: int, source_name: str, entity_id: str, 
+                               source_record: Dict[str, Any], record_hash: str, 
+                               load_ts: str) -> int:
+        """Flatten JSON and insert resulting fields into staging"""
+        fields = []
+        
+        # Recursively flatten the JSON
+        self._flatten_json(
+            raw_id=raw_id,
+            source_name=source_name,
+            entity_id=entity_id,
+            obj=source_record,
+            prefix="",
+            record_hash=record_hash,
+            load_ts=load_ts,
+            fields=fields
+        )
+        
+        # Insert in batches for better performance
+        batch_size = 1000
+        for i in range(0, len(fields), batch_size):
+            batch = fields[i:i+batch_size]
+            
+            insert_values = []
+            placeholders = []
+            
+            for field in batch:
+                insert_values.extend([
+                    raw_id, 
+                    entity_id, 
+                    field['field_name'], 
+                    field['field_path'], 
+                    field['field_value'], 
+                    field['field_ordinal'],
+                    load_ts, 
+                    source_name, 
+                    record_hash
+                ])
+                placeholders.append("(%s, %s, %s, %s, %s, %s, %s, %s, %s)")
+            
+            # Bulk insert
+            query = f"""
+                INSERT INTO stg.COVID_STG (
+                    raw_id, entity_id, field_name, field_path, field_value, field_ordinal,
+                    load_ts, source_name, raw_hash
+                ) 
+                VALUES {', '.join(placeholders)}
+            """
+            
+            cursor = self.snowflake.conn.cursor()
+            cursor.execute(query, insert_values)
+            cursor.close()
+        
+        return len(fields)
+    
+    def _flatten_json(self, raw_id: int, source_name: str, entity_id: str, obj: Dict[str, Any], 
+                    prefix: str, record_hash: str, load_ts: str, fields: List[Dict[str, Any]]) -> None:
+        """Recursively flatten JSON and collect fields"""
+        for key, value in obj.items():
+            path = f"{prefix}.{key}" if prefix else key
+            
+            if isinstance(value, dict):
+                # Recursively process nested objects
+                self._flatten_json(
+                    raw_id=raw_id,
+                    source_name=source_name,
+                    entity_id=entity_id,
+                    obj=value,
+                    prefix=path,
+                    record_hash=record_hash,
+                    load_ts=load_ts,
+                    fields=fields
+                )
+            elif isinstance(value, list):
+                # Handle arrays
+                if not value:
+                    # Empty array
+                    fields.append({
+                        'field_name': key,
+                        'field_path': path,
+                        'field_value': "",
+                        'field_ordinal': None
+                    })
+                else:
+                    # Handle array items
+                    for i, item in enumerate(value):
+                        if isinstance(item, dict):
+                            # Object in array
+                            self._flatten_json(
+                                raw_id=raw_id,
+                                source_name=source_name,
+                                entity_id=entity_id,
+                                obj=item,
+                                prefix=f"{path}[{i}]",
+                                record_hash=record_hash,
+                                load_ts=load_ts,
+                                fields=fields
+                            )
                         else:
-                            value = bool(value)
-                    elif data_type != 'ARRAY' and value is not None:
-                        value = str(value)
+                            # Primitive value in array
+                            fields.append({
+                                'field_name': key,
+                                'field_path': f"{path}[{i}]",
+                                'field_value': self._to_string(item),
+                                'field_ordinal': i
+                            })
                     
-                    values[target_column] = value
+                    # Also store the full array as JSON string
+                    fields.append({
+                        'field_name': key,
+                        'field_path': path,
+                        'field_value': json.dumps(value),
+                        'field_ordinal': None
+                    })
+            else:
+                # Store leaf value as string with no transformations
+                fields.append({
+                    'field_name': key,
+                    'field_path': path,
+                    'field_value': self._to_string(value),
+                    'field_ordinal': None
+                })
+    
+    def _to_string(self, value: Any) -> Optional[str]:
+        """Safely convert any value to string"""
+        if value is None:
+            return None
+        return str(value)
+    
+    def _track_performance(self, process_name: str, execution_time_ms: int, rows_processed: int) -> None:
+        """Track performance metrics"""
+        query = """
+            INSERT INTO meta.PERFORMANCE_METRICS (
+                process_name,
+                execution_time_ms,
+                rows_processed
+            )
+            VALUES (%(process_name)s, %(execution_time_ms)s, %(rows_processed)s)
+        """
+        
+        try:
+            self.snowflake.execute_query(
+                query,
+                {
+                    'process_name': process_name,
+                    'execution_time_ms': execution_time_ms,
+                    'rows_processed': rows_processed
+                }
+            )
+        except Exception as e:
+            logger.error(f"Failed to track performance: {e}")
+
+
+class ViewCreationHandler:
+    """Handler for creating dynamic views based on schema registry"""
+    
+    def __init__(self, snowflake_client: SnowflakeClient):
+        self.snowflake = snowflake_client
+        self.max_fields_per_view = 950  # Snowflake limit is 1000 columns
+    
+    def create_dynamic_view(self, view_name: str, source_name: str) -> Dict[str, Any]:
+        """Create or update a dynamic view based on schema registry"""
+        logger.info(f"Creating dynamic view {view_name} for {source_name}")
+        start_time = time.time()
+        
+        # Get fields from schema registry
+        query = """
+            SELECT field_name, field_path
+            FROM meta.SCHEMA_REGISTRY
+            WHERE source_name = %(source_name)s
+            AND is_active = TRUE
+            ORDER BY field_path
+        """
+        
+        fields = self.snowflake.execute_query(
+            query,
+            {'source_name': source_name}
+        )
+        
+        if not fields:
+            logger.warning(f"No fields found in schema registry. Source: {source_name}")
+            return {
+                'status': 'ERROR',
+                'message': 'No fields found in schema registry'
+            }
+        
+        # Calculate how many views we need to create (to avoid column limit)
+        view_count = (len(fields) + self.max_fields_per_view - 1) // self.max_fields_per_view
+        created_views = []
+        
+        for view_index in range(view_count):
+            start_idx = view_index * self.max_fields_per_view
+            end_idx = min(start_idx + self.max_fields_per_view, len(fields))
+            current_fields = fields[start_idx:end_idx]
+            
+            current_view_name = view_name
+            if view_count > 1:
+                current_view_name = f"{view_name}_PART{view_index+1}"
+            
+            # Build dynamic SQL for pivot operation
+            view_sql = f"""
+                CREATE OR REPLACE VIEW {current_view_name} AS
+                WITH all_entities AS (
+                    SELECT DISTINCT entity_id, load_ts, raw_id
+                    FROM stg.COVID_STG
+                    WHERE source_name = '{source_name}'
+                )
+                SELECT 
+                    e.entity_id,
+                    e.load_ts,
+                    e.raw_id
+            """
+            
+            # Add MAX CASE expression for each field
+            for field in current_fields:
+                field_name = field['FIELD_NAME']
+                field_path = field['FIELD_PATH']
+                safe_field_name = re.sub(r'[^a-zA-Z0-9_]', '_', field_name)
                 
-                # Add metadata columns - match the March 2025 schema
-                values['load_ts'] = batch_load_ts
-                values['source'] = source_name
-                values['raw_id'] = raw_id
-                values['processed_flag'] = True
-                values['processed_timestamp'] = 'CURRENT_TIMESTAMP'
-                values['quality_check_passed'] = True
-                
-                # Generate SQL for insertion
-                columns = ', '.join(values.keys())
-                placeholders = ', '.join(['%s'] * len(values))
-                insert_sql = f"""
-                INSERT INTO {staging_table} ({columns}) 
-                VALUES ({placeholders})
+                view_sql += f"""
+                    , MAX(CASE WHEN s.field_path = '{field_path}' THEN s.field_value END) AS "{safe_field_name}"
                 """
+            
+            view_sql += """
+                FROM all_entities e
+                LEFT JOIN stg.COVID_STG s
+                    ON e.entity_id = s.entity_id 
+                    AND e.load_ts = s.load_ts
+                    AND e.raw_id = s.raw_id
+                GROUP BY e.entity_id, e.load_ts, e.raw_id
+            """
+            
+            # Create the view
+            try:
+                self.snowflake.execute_script(view_sql)
+                created_views.append({
+                    'name': current_view_name,
+                    'field_count': len(current_fields)
+                })
                 
-                # Execute insert
-                self.execute_query(insert_sql, tuple(values.values()))
-                
-                # Mark as processed
-                update_sql = """
-                UPDATE raw3.COVID_COUNTRY_RAW
-                SET is_processed = TRUE,
-                    processed_timestamp = CURRENT_TIMESTAMP()
-                WHERE raw_id = %s
-                """
-                self.execute_query(update_sql, (raw_id,))
-                
-                processed_count += 1
+                # Create union view (only needed if multiple parts)
+                if view_count > 1 and view_index == 0:
+                    union_view_sql = f"""
+                        CREATE OR REPLACE VIEW {view_name} AS
+                        SELECT * FROM {current_view_name}
+                    """
+                    self.snowflake.execute_script(union_view_sql)
             except Exception as e:
-                error_count += 1
-                logger.error(f"Error processing record {raw_id}: {str(e)}")
+                logger.error(f"Error creating view {current_view_name}: {e}")
+                return {
+                    'status': 'ERROR',
+                    'message': f'Error creating view: {str(e)}'
+                }
+        
+        # Calculate execution time
+        execution_time_ms = int((time.time() - start_time) * 1000)
+        
+        return {
+            'status': 'SUCCESS',
+            'message': f'Successfully created {len(created_views)} view(s)',
+            'total_fields': len(fields),
+            'execution_time_ms': execution_time_ms,
+            'views': created_views
+        }
+
+
+class CovidDataPipeline:
+    """Main COVID-19 data pipeline with enhanced features"""
+    
+    def __init__(self):
+        """Initialize the pipeline"""
+        logger.info("Initializing COVID-19 data pipeline")
+        self.snowflake = SnowflakeClient(SNOWFLAKE_CONFIG)
+        self.api = CovidApiClient(COVID_API_ENDPOINT)
+        self.schema_handler = SchemaDiscoveryHandler(self.snowflake)
+        self.flatten_handler = DataFlatteningHandler(self.snowflake, self.schema_handler)
+        self.view_handler = ViewCreationHandler(self.snowflake)
+        self.compliance_dir = Path("compliance_archive")
+        self.compliance_dir.mkdir(exist_ok=True)
+    
+    def generate_batch_id(self) -> str:
+        """Generate a batch ID for the current data load"""
+        return datetime.now().strftime('%Y%m%d%H%M%S')
+    
+    def calculate_hash(self, data: Any) -> str:
+        """Calculate SHA-256 hash of data"""
+        return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
+    
+    def insert_raw_data(self, entity_id: str, data: Dict[str, Any], 
+                       batch_id: str, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        """Insert raw COVID data into Snowflake without any transformations"""
+        try:
+            # Calculate hash for data integrity
+            record_hash = self.calculate_hash(data)
+            
+            # Save original data locally for compliance (belt and suspenders)
+            self._save_raw_data_locally(entity_id, data, metadata, batch_id, record_hash)
+            
+            # Insert the raw record
+            query = """
+            INSERT INTO raw.COVID_RAW (
+                source_name,
+                entity_id,
+                source_record,
+                record_hash,
+                load_ts,
+                api_endpoint,
+                api_params
+            ) 
+            SELECT 
+                %(source_name)s,
+                %(entity_id)s,
+                PARSE_JSON(%(data)s),
+                %(hash)s,
+                %(batch_id)s,
+                %(endpoint)s,
+                PARSE_JSON(%(params)s)
+            """
+            
+            self.snowflake.execute_query(
+                query,
+                {
+                    'source_name': SOURCE_NAME,
+                    'entity_id': entity_id,
+                    'data': json.dumps(data),  # Raw JSON - no modifications
+                    'hash': record_hash,
+                    'batch_id': batch_id,
+                    'endpoint': metadata.get('endpoint', ''),
+                    'params': json.dumps(metadata.get('params', {}))
+                }
+            )
+            
+            logger.info(f"Successfully inserted raw data for entity: {entity_id}")
+            return {
+                'status': 'success', 
+                'entity_id': entity_id,
+                'hash': record_hash
+            }
+            
+        except Exception as e:
+            logger.error(f"Error inserting data for entity {entity_id}: {e}")
+            return {
+                'status': 'error', 
+                'entity_id': entity_id, 
+                'error': str(e)
+            }
+    
+    def _save_raw_data_locally(self, entity_id: str, data: Dict[str, Any], 
+                             metadata: Dict[str, Any], batch_id: str, 
+                             hash_value: str) -> None:
+        """Save raw data locally as additional compliance measure"""
+        try:
+            # Create compliance subdirectory for this batch
+            batch_dir = self.compliance_dir / batch_id
+            batch_dir.mkdir(exist_ok=True)
+            
+            # Create record with metadata
+            record = {
+                'entity_id': entity_id,
+                'source_name': SOURCE_NAME,
+                'batch_id': batch_id,
+                'record_hash': hash_value,
+                'metadata': metadata,
+                'raw_data': data  # Untransformed raw data
+            }
+            
+            # Use hash in filename for easy lookup
+            filename = batch_dir / f"{hash_value}_{entity_id}.json"
+            
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(record, f, indent=2, ensure_ascii=False)
                 
-                # Log error
-                error_sql = """
-                INSERT INTO meta.INGEST_AUDIT_LOG (
+            logger.debug(f"Saved raw data locally: {filename}")
+        except Exception as e:
+            # Log but don't fail - this is a supplementary compliance measure
+            logger.warning(f"Failed to save raw data locally: {e}")
+    
+    def fetch_and_load_all_countries(self) -> Dict[str, Any]:
+        """Fetch and load COVID data for all countries"""
+        start_time = time.time()
+        batch_id = self.generate_batch_id()
+        logger.info(f"Starting COVID data fetch with batch ID: {batch_id}")
+        
+        try:
+            # Fetch all countries data
+            countries_data, metadata = self.api.fetch_countries_data()
+            
+            # Process each country record
+            succeeded = 0
+            failed = 0
+            results = []
+            
+            for country_data in countries_data:
+                # Extract entity_id (country name) from data
+                entity_id = country_data.get('country', 'unknown')
+                
+                # Insert raw data without any transformations
+                result = self.insert_raw_data(entity_id, country_data, batch_id, metadata)
+                results.append(result)
+                
+                if result['status'] == 'success':
+                    succeeded += 1
+                else:
+                    failed += 1
+            
+            execution_time_ms = int((time.time() - start_time) * 1000)
+            
+            # Log to audit table
+            log_query = """
+                CALL meta.LOG_OPERATION(
+                    %(operation_name)s,
+                    %(target_table)s,
+                    %(record_count)s,
+                    %(source_name)s,
+                    %(load_ts)s,
+                    %(status)s,
+                    %(error_message)s,
+                    %(execution_time_ms)s
+                )
+            """
+            
+            self.snowflake.execute_query(
+                log_query,
+                {
+                    'operation_name': 'FETCH_AND_LOAD_ALL_COUNTRIES',
+                    'target_table': 'raw.COVID_RAW',
+                    'record_count': succeeded,
+                    'source_name': SOURCE_NAME,
+                    'load_ts': batch_id,
+                    'status': 'PARTIAL_SUCCESS' if failed > 0 else 'SUCCESS',
+                    'error_message': f"Failed to process {failed} countries" if failed > 0 else None,
+                    'execution_time_ms': execution_time_ms
+                }
+            )
+            
+            logger.info(f"Completed COVID data fetch. Succeeded: {succeeded}, Failed: {failed}")
+            
+            return {
+                'status': 'SUCCESS' if failed == 0 else 'PARTIAL_SUCCESS',
+                'batch_id': batch_id,
+                'succeeded': succeeded,
+                'failed': failed,
+                'execution_time_ms': execution_time_ms,
+                'results': results
+            }
+            
+        except Exception as e:
+            execution_time_ms = int((time.time() - start_time) * 1000)
+            
+            # Log error to audit table
+            log_query = """
+                CALL meta.LOG_OPERATION(
+                    %(operation_name)s,
+                    %(target_table)s,
+                    %(record_count)s,
+                    %(source_name)s,
+                    %(load_ts)s,
+                    %(status)s,
+                    %(error_message)s,
+                    %(execution_time_ms)s
+                )
+            """
+            
+            self.snowflake.execute_query(
+                log_query,
+                {
+                    'operation_name': 'FETCH_AND_LOAD_ALL_COUNTRIES',
+                    'target_table': 'raw.COVID_RAW',
+                    'record_count': 0,
+                    'source_name': SOURCE_NAME,
+                    'load_ts': batch_id,
+                    'status': 'ERROR',
+                    'error_message': str(e),
+                    'execution_time_ms': execution_time_ms
+                }
+            )
+            
+            logger.error(f"Failed to fetch and load COVID data: {e}")
+            
+            return {
+                'status': 'ERROR',
+                'batch_id': batch_id,
+                'error': str(e),
+                'execution_time_ms': execution_time_ms
+            }
+    
+    def archive_data(self, days_to_keep: int = 90) -> Dict[str, Any]:
+        """Archive data older than the specified number of days"""
+        try:
+            logger.info(f"Archiving data older than {days_to_keep} days")
+            
+            from datetime import datetime, timedelta
+            cutoff_date = (datetime.now() - timedelta(days=days_to_keep)).strftime('%Y-%m-%d')
+            
+            result = self.snowflake.execute_procedure(
+                'meta.ARCHIVE_DATA', 
+                [cutoff_date]
+            )
+            
+            logger.info(f"Archive completed: {result}")
+            return result
+        except Exception as e:
+            logger.error(f"Failed to archive data: {e}")
+            raise
+    
+    def export_to_csv(self, query: str, filename: str) -> str:
+        """Export data to local CSV file"""
+        try:
+            logger.info(f"Exporting data to CSV: {filename}")
+            
+            # Execute query
+            results = self.snowflake.execute_query(query)
+            
+            if not results:
+                logger.warning("No data to export")
+                return None
+            
+            # Convert to DataFrame
+            df = pd.DataFrame(results)
+            
+            # Ensure output directory exists
+            output_dir = os.path.dirname(filename)
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
+            
+            # Write to CSV
+            df.to_csv(filename, index=False)
+            
+            logger.info(f"Successfully exported data to: {filename}")
+            return filename
+        except Exception as e:
+            logger.error(f"Failed to export data to CSV: {e}")
+            raise
+    
+    def run_pipeline(self) -> Dict[str, Any]:
+        """Run the full COVID data pipeline"""
+        try:
+            # 1. Fetch and load raw data (with no transformations)
+            fetch_result = self.fetch_and_load_all_countries()
+            
+            if fetch_result['status'] == 'ERROR':
+                raise Exception(f"Failed to fetch data: {fetch_result.get('error')}")
+            
+            batch_id = fetch_result['batch_id']
+            
+            # 2. Flatten JSON data to staging (processed in Python, not JavaScript UDFs)
+            flatten_result = self.flatten_handler.flatten_json_to_staging(SOURCE_NAME, batch_id)
+            
+            if flatten_result['status'] == 'ERROR':
+                raise Exception(f"Failed to flatten data: {flatten_result.get('message')}")
+            
+            # 3. Create dynamic views (processed in Python, not JavaScript UDFs)
+            view_result = self.view_handler.create_dynamic_view('shared.COVID_FLATTENED_VIEW', SOURCE_NAME)
+            
+            # 4. Export sample data for verification
+            export_path = f"./exports/{batch_id}"
+            Path(export_path).mkdir(parents=True, exist_ok=True)
+            
+            # Export a sample of raw data
+            raw_csv = self.export_to_csv(
+                f"""
+                SELECT 
+                    entity_id, 
+                    raw_id,
+                    record_hash,
+                    ingestion_timestamp
+                FROM raw.COVID_RAW
+                WHERE load_ts = '{batch_id}'
+                LIMIT 100
+                """,
+                f"{export_path}/covid_raw_sample.csv"
+            )
+            
+            # Export a sample of flattened data
+            flattened_csv = self.export_to_csv(
+                f"""
+                SELECT 
+                    entity_id,
+                    field_name,
+                    field_path,
+                    field_value,
+                    load_ts
+                FROM stg.COVID_STG
+                WHERE load_ts = '{batch_id}'
+                LIMIT 1000
+                """,
+                f"{export_path}/covid_flattened_sample.csv"
+            )
+            
+            # Export flattened schema
+            schema_csv = self.export_to_csv(
+                f"""
+                SELECT 
+                    field_name,
+                    field_path,
+                    field_example,
+                    data_type,
+                    first_seen_ts,
+                    last_seen_ts
+                FROM meta.SCHEMA_REGISTRY
+                WHERE source_name = '{SOURCE_NAME}'
+                AND is_active = TRUE
+                ORDER BY field_path
+                """,
+                f"{export_path}/covid_schema.csv"
+            )
+            
+            # Generate compliance verification report
+            compliance_report = self.export_to_csv(
+                f"""
+                WITH raw_counts AS (
+                    SELECT COUNT(*) as raw_count 
+                    FROM raw.COVID_RAW 
+                    WHERE load_ts = '{batch_id}'
+                ),
+                entity_counts AS (
+                    SELECT COUNT(DISTINCT entity_id) as entity_count
+                    FROM raw.COVID_RAW
+                    WHERE load_ts = '{batch_id}'
+                ),
+                field_counts AS (
+                    SELECT COUNT(*) as field_count
+                    FROM stg.COVID_STG
+                    WHERE load_ts = '{batch_id}'
+                )
+                SELECT
+                    '{batch_id}' as batch_id,
+                    r.raw_count as raw_records,
+                    e.entity_count as unique_entities,
+                    f.field_count as flattened_fields,
+                    f.field_count > 0 as flattening_completed,
+                    CURRENT_TIMESTAMP() as report_timestamp
+                FROM 
+                    raw_counts r, 
+                    entity_counts e,
+                    field_counts f
+                """,
+                f"{export_path}/compliance_report.csv"
+            )
+            
+            # Export audit log
+            audit_csv = self.export_to_csv(
+                f"""
+                SELECT 
+                    load_ts,
                     table_name,
                     record_count,
-                    source,
                     process_name,
                     process_status,
                     error_message,
-                    execution_time_ms
-                )
-                VALUES (%s, 1, %s, %s, %s, %s, %s)
-                """
-                execution_time = (datetime.datetime.now() - start_time).total_seconds() * 1000
-                self.execute_query(
-                    error_sql,
-                    (
-                        source_table,
-                        source_name,
-                        'PYTHON_PROCESS_SCRIPT',
-                        'ERROR',
-                        f"Error processing record {raw_id}: {str(e)}",
-                        execution_time
-                    )
-                )
-        
-        # Run data quality checks using the existing Snowflake procedure
-        # This matches the March 2025 implementation approach
-        quality_check_sql = f"""
-        CALL quality.PROC_RUN_DATA_QUALITY_CHECKS('{staging_table}', '{batch_load_ts}')
-        """
-        try:
-            self.execute_query(quality_check_sql)
-            logger.info(f"Quality checks completed for batch {batch_load_ts}")
+                    execution_time_ms,
+                    load_time,
+                    user_name
+                FROM meta.INGEST_AUDIT_LOG
+                WHERE load_ts = '{batch_id}'
+                ORDER BY load_time
+                """,
+                f"{export_path}/audit_log.csv"
+            )
+            
+            logger.info("COVID data pipeline completed successfully")
+            
+            return {
+                'status': 'SUCCESS',
+                'batch_id': batch_id,
+                'fetch_result': fetch_result,
+                'flatten_result': flatten_result,
+                'view_result': view_result,
+                'exports': {
+                    'raw_sample': raw_csv,
+                    'flattened_sample': flattened_csv,
+                    'schema': schema_csv,
+                    'compliance_report': compliance_report,
+                    'audit_log': audit_csv
+                }
+            }
         except Exception as e:
-            logger.error(f"Error running quality checks: {str(e)}")
-            # Non-fatal error, continue processing
+            logger.error(f"Pipeline execution failed: {e}")
+            raise
+    
+    def close(self) -> None:
+        """Close connections"""
+        if hasattr(self, 'snowflake'):
+            self.snowflake.close()
+
+
+def main():
+    """Main entry point with dynamic schema support"""
+    # Create directories if they don't exist
+    Path("logs").mkdir(exist_ok=True)
+    Path("exports").mkdir(exist_ok=True)
+    Path("compliance_archive").mkdir(exist_ok=True)
+    
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description='COVID-19 Data Pipeline (Pure Python, March 2025)')
+    parser.add_argument('command', choices=['run', 'fetch', 'flatten', 'view', 'archive', 'export'], 
+                      help='Command to execute')
+    parser.add_argument('--batch-id', help='Batch ID for processing')
+    parser.add_argument('--view-name', help='Name for dynamic view creation', default='shared.COVID_VIEW')
+    parser.add_argument('--query', help='SQL query for export')
+    parser.add_argument('--output', help='Output filename for export')
+    parser.add_argument('--days', type=int, default=90, help='Days of data to keep (for archive)')
+    
+    args = parser.parse_args()
+    
+    pipeline = CovidDataPipeline()
+    
+    try:
+        if args.command == 'fetch':
+            result = pipeline.fetch_and_load_all_countries()
+            print(json.dumps(result, indent=2))
+            
+        elif args.command == 'flatten':
+            batch_id = args.batch_id
+            if not batch_id:
+                print("Error: flatten command requires --batch-id")
+                sys.exit(1)
+                
+            result = pipeline.flatten_handler.flatten_json_to_staging(SOURCE_NAME, batch_id)
+            print(json.dumps(result, indent=2))
+            
+        elif args.command == 'view':
+            result = pipeline.view_handler.create_dynamic_view(args.view_name, SOURCE_NAME)
+            print(json.dumps(result, indent=2))
+            
+        elif args.command == 'archive':
+            result = pipeline.archive_data(args.days)
+            print(json.dumps(result, indent=2))
+            
+        elif args.command == 'export':
+            if not args.query:
+                print("Error: Export requires a SQL query (--query)")
+                sys.exit(1)
+                
+            filename = args.output or f"./exports/export_{pipeline.generate_batch_id()}.csv"
+            result = pipeline.export_to_csv(args.query, filename)
+            print(f"Exported to: {result}")
+            
+        else:  # 'run'
+            result = pipeline.run_pipeline()
+            print(json.dumps(result, indent=2))
+            
+    except Exception as e:
+        logger.error(f"Command execution failed: {e}")
+        sys.exit(1)
+    finally:
+        pipeline.close()
+
+
+if __name__ == "__main__":
+    main()
+#!/usr/bin/env python3
+"""
+COVID-19 Data Pipeline - Enhanced Python Client
+Created: March 2025
+Last Updated: March 30, 2025
+
+This script runs on a local machine and handles all dynamic processing
+that was previously in JavaScript UDFs within Snowflake. It interacts directly
+with the disease.sh API to fetch COVID data and handles schema discovery,
+flattening, and view creation - all from the local machine.
+
+Requirements:
+- Python 3.8+
+- snowflake-connector-python
+- requests
+- python-dotenv
+- pandas
+"""
+
+import os
+import sys
+import json
+import time
+import hashlib
+import logging
+import argparse
+import re
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Any, Optional, Union, Tuple, Set
+
+import requests
+import pandas as pd
+from dotenv import load_dotenv
+import snowflake.connector
+from snowflake.connector.pandas_tools import write_pandas
+
+# Load environment variables
+load_dotenv()
+
+# Configure logging
+logging.basicConfig(
+    level=os.getenv('LOG_LEVEL', 'INFO'),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(f"logs/covid_pipeline_{datetime.now().strftime('%Y%m%d')}.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger('covid_pipeline')
+
+# Snowflake connection configuration
+SNOWFLAKE_CONFIG = {
+    'account': os.getenv('SNOWFLAKE_ACCOUNT'),
+    'user': os.getenv('SNOWFLAKE_USERNAME'),
+    'password': os.getenv('SNOWFLAKE_PASSWORD'),
+    'warehouse': os.getenv('SNOWFLAKE_WAREHOUSE', 'compute_wh'),
+    'database': os.getenv('SNOWFLAKE_DATABASE', 'covid'),
+    'schema': os.getenv('SNOWFLAKE_SCHEMA', 'raw'),
+    'role': os.getenv('SNOWFLAKE_ROLE', 'sysadmin')
+}
+
+# External COVID API configuration
+COVID_API_ENDPOINT = os.getenv('COVID_API_ENDPOINT', 'https://disease.sh/v3/covid-19')
+SOURCE_NAME = 'disease.sh'  # Source identifier
+
+
+class SnowflakeClient:
+    """Client for interacting with Snowflake"""
+    
+    def __init__(self, config: Dict[str, str]):
+        """Initialize Snowflake connection"""
+        self.config = config
+        self.conn = None
+        self.connect()
+    
+    def connect(self) -> None:
+        """Establish connection to Snowflake"""
+        try:
+            self.conn = snowflake.connector.connect(
+                user=self.config['user'],
+                password=self.config['password'],
+                account=self.config['account'],
+                warehouse=self.config['warehouse'],
+                database=self.config['database'],
+                schema=self.config['schema'],
+                role=self.config['role']
+            )
+            logger.info("Successfully connected to Snowflake!")
+        except snowflake.connector.errors.DatabaseError as e:
+            logger.error(f"Error connecting to Snowflake: {e}")
+            sys.exit(1)
+    
+    def execute_query(self, query: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """Execute a SQL query and return results"""
+        try:
+            cursor = self.conn.cursor(snowflake.connector.DictCursor)
+            if params:
+                cursor.execute(query, params)
+            else:
+                cursor.execute(query)
+            
+            results = cursor.fetchall()
+            cursor.close()
+            return results
+        except snowflake.connector.errors.DatabaseError as e:
+            logger.error(f"Error executing SQL query: {e}")
+            logger.debug(f"Query: {query}")
+            logger.debug(f"Params: {params}")
+            raise
+    
+    def execute_script(self, script: str) -> None:
+        """Execute a multi-statement SQL script"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute(script)
+            cursor.close()
+            logger.info("Successfully executed SQL script")
+        except snowflake.connector.errors.DatabaseError as e:
+            logger.error(f"Error executing SQL script: {e}")
+            raise
+    
+    def execute_procedure(self, procedure: str, params: List[Any]) -> Dict[str, Any]:
+        """Execute a stored procedure and return results"""
+        try:
+            cursor = self.conn.cursor(snowflake.connector.DictCursor)
+            result = cursor.execute(f"CALL {procedure}({', '.join(['%s'] * len(params))})", params)
+            row = result.fetchone()
+            cursor.close()
+            return dict(row) if row else {}
+        except snowflake.connector.errors.DatabaseError as e:
+            logger.error(f"Error executing procedure {procedure}: {e}")
+            raise
+    
+    def close(self) -> None:
+        """Close Snowflake connection"""
+        if self.conn:
+            try:
+                self.conn.close()
+                logger.info("Snowflake connection closed.")
+            except:
+                pass
+
+
+class CovidApiClient:
+    """Client for interacting with COVID-19 API"""
+    
+    def __init__(self, base_url: str):
+        """Initialize API client"""
+        self.base_url = base_url
+        self.headers = {
+            'User-Agent': 'Covid-Data-Pipeline/1.0 (compliance@example.org)',
+            'Accept': 'application/json'
+        }
+    
+    def fetch_countries_data(self) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """Fetch COVID data for all countries and return with metadata"""
+        endpoint = f"{self.base_url}/countries"
+        logger.info(f"Fetching data from: {endpoint}")
         
-        # Record summary in audit log
-        end_time = datetime.datetime.now()
-        execution_time = (end_time - start_time).total_seconds() * 1000
+        params = {}
+        try:
+            response = requests.get(endpoint, headers=self.headers, params=params)
+            response.raise_for_status()
+            data = response.json()
+            
+            # Create metadata about this request
+            metadata = {
+                'endpoint': endpoint,
+                'params': params,
+                'status_code': response.status_code,
+                'timestamp': datetime.now().isoformat(),
+                'response_time_ms': response.elapsed.total_seconds() * 1000
+            }
+            
+            logger.info(f"Successfully fetched data for {len(data)} countries")
+            return data, metadata
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error fetching COVID data: {e}")
+            raise
+    
+    def fetch_country_data(self, country: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Fetch COVID data for a specific country and return with metadata"""
+        endpoint = f"{self.base_url}/countries/{country}"
+        logger.info(f"Fetching data for country: {country}")
         
-        audit_sql = """
-        INSERT INTO meta
+        params = {}
+        try:
+            response = requests.get(endpoint, headers=self.headers, params=params)
+            response.raise_for_status()
+            data = response.json()
+            
+            # Create metadata about this request
+            metadata = {
+                'endpoint': endpoint,
+                'params': params,
+                'status_code': response.status_code,
+                'timestamp': datetime.now().isoformat(),
+                'response_time_ms': response.elapsed.total_seconds() * 1000
+            }
+            
+            logger.info(f"Successfully fetched data for {country}")
+            return data, metadata
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error fetching COVID data for {country}: {e}")
+            raise
+
+
+class SchemaDiscoveryHandler:
+    """Handler for schema discovery and registry"""
+    
+    def __init__(self, snowflake_client: SnowflakeClient):
+        self.snowflake = snowflake_client
+    
+    def discover_and_register_schema(self, source_name: str, load_ts: str) -> Dict[str, Any]:
+        """Discover schema from raw records and register fields"""
+        logger.info(f"Discovering schema for {source_name}, batch {load_ts}")
+        start_time = time.time()
+        
+        # Get sample records
+        query = """
+            SELECT source_record 
+            FROM raw.COVID_RAW
+            WHERE source_name = %(source_name)s
+            AND load_ts = %(load_ts)s
+            LIMIT 100
+        """
+        
+        records = self.snowflake.execute_query(
+            query, 
+            {'source_name': source_name, 'load_ts': load_ts}
+        )
+        
+        if not records:
+            logger.warning(f"No records found for schema discovery. Source: {source_name}, Load TS: {load_ts}")
+            return {
+                'status': 'ERROR',
+                'message': 'No records found for schema discovery'
+            }
+        
+        # Process records to discover schema
+        discovered_fields = {}
+        
+        for record in records:
+            source_record = record['SOURCE_RECORD']
+            self._discover_schema(source_record, "", discovered_fields)
+        
+        # Register discovered fields
+        fields_registered = 0
+        
+        for field_path, field_info in discovered_fields.items():
+            self._register_field(
+                source_name=source_name,
+                field_name=field_info['name'],
+                field_path=field_path,
+                field_example=field_info['example'],
+                data_type=field_info['type'],
+                load_ts=load_ts
+            )
+            fields_registered += 1
+        
+        # Log the operation
+        execution_time_ms = int((time.time() - start_time) * 1000)
+        
+        self._log_operation(
+            operation_name='DISCOVER_AND_REGISTER_SCHEMA',
+            target_table='meta.SCHEMA_REGISTRY',
+            record_count=fields_registered,
+            source_name=source_name,
+            load_ts=load_ts,
+            status='SUCCESS',
+            execution_time_ms=execution_time_ms
+        )
+        
+        return {
+            'status': 'SUCCESS',
+            'message': f'Successfully discovered and registered schema',
+            'fields_discovered': fields_registered,
+            'execution_time_ms': execution_time_ms
+        }
+    
+    def _discover_schema(self, obj: Dict[str, Any], prefix: str, result: Dict[str, Dict[str, Any]]) -> None:
+        """Recursively discover schema from a JSON object"""
+        for key, value in obj.items():
+            path = f"{prefix}.{key}" if prefix else key
+            value_type = self._get_json_type(value)
+            
+            if value_type == 'object' and value is not None:
+                # Recursively process nested objects
+                self._discover_schema(value, path, result)
+            elif value_type == 'array' and value:
+                # For arrays, process each item type
+                if isinstance(value[0], dict):
+                    # Array of objects - append index to path
+                    for i, item in enumerate(value[:5]):  # Process up to 5 items
+                        self._discover_schema(item, f"{path}[{i}]", result)
+                else:
+                    # Array of primitives - just register the array itself
+                    result[path] = {
+                        'name': key,
+                        'type': 'ARRAY',
+                        'example': str(value)[:255]
+                    }
+            else:
+                # Register leaf node
+                result[path] = {
+                    'name': key,
+                    'type': value_type.upper(),
+                    'example': str(value)[:255] if value is not None else 'NULL'
+                }
+    
+    def _get_json_type(self, value: Any) -> str:
+        """Get JSON data type as string"""
+        if value is None:
+            return 'null'
+        
+        if isinstance(value, dict):
+            return 'object'
+        elif isinstance(value, list):
+            return 'array'
+        elif isinstance(value, bool):
+            return 'boolean'
+        elif isinstance(value, int):
+            return 'number'
+        elif isinstance(value, float):
+            return 'number'
+        else:
+            return 'string'
+    
+    def _register_field(self, source_name: str, field_name: str, field_path: str, 
+                       field_example: str, data_type: str, load_ts: str) -> None:
+        """Register a field in the schema registry"""
+        query = """
+            MERGE INTO meta.SCHEMA_REGISTRY target
+            USING (SELECT %(source_name)s as source_name, %(field_name)s as field_name, %(field_path)s as field_path) source
+            ON target.source_name = source.source_name AND target.field_path = source.field_path
+            WHEN MATCHED THEN
+                UPDATE SET
