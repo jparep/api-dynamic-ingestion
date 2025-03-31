@@ -28,6 +28,10 @@ from dotenv import load_dotenv
 import snowflake.connector
 from snowflake.connector.pandas_tools import write_pandas
 
+# Define global variables at module level
+TEST_MODE = True  # Enable test mode to limit records
+TEST_RECORD_LIMIT = 10  # Number of records to process in test mode
+
 # Debug information for environment variables
 print("Current directory:", os.getcwd())
 print("Files in directory:", os.listdir())
@@ -71,8 +75,6 @@ print("SNOWFLAKE_CONFIG:", {k: v if k != 'password' else '******' for k, v in SN
 # External COVID API configuration
 COVID_API_ENDPOINT = os.getenv('COVID_API_ENDPOINT', 'https://disease.sh/v3/covid-19')
 SOURCE_NAME = 'disease.sh'  # Source identifier
-TEST_MODE = True  # Enable test mode to limit to 10 records
-TEST_RECORD_LIMIT = 10  # Number of records to process in test mode
 
 
 class SnowflakeClient:
@@ -133,7 +135,7 @@ class SnowflakeClient:
             raise
     
     def close(self) -> None:
-        """Close Snowflake connection"""
+        """Close connections"""
         if self.conn:
             try:
                 self.conn.close()
