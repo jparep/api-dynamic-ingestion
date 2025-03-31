@@ -8,13 +8,6 @@ This script runs on a local machine and handles all dynamic processing
 that was previously in JavaScript UDFs within Snowflake. It interacts directly
 with the disease.sh API to fetch COVID data and handles schema discovery,
 flattening, and view creation - all from the local machine.
-
-Requirements:
-- Python 3.8+
-- snowflake-connector-python
-- requests
-- python-dotenv
-- pandas
 """
 
 import os
@@ -35,8 +28,20 @@ from dotenv import load_dotenv
 import snowflake.connector
 from snowflake.connector.pandas_tools import write_pandas
 
+# Debug environment variables
+print("Current directory:", os.getcwd())
+print("Files in directory:", os.listdir())
+print("Checking for .env file:", os.path.exists('.env'))
+
 # Load environment variables
 load_dotenv()
+# Debug loaded variables
+print("SNOWFLAKE_USERNAME:", os.getenv('SNOWFLAKE_USERNAME'))
+print("SNOWFLAKE_ACCOUNT:", os.getenv('SNOWFLAKE_ACCOUNT'))
+
+
+# Ensure logs directory exists before setting up logging
+Path("logs").mkdir(parents=True, exist_ok=True)
 
 # Configure logging
 logging.basicConfig(
@@ -54,14 +59,14 @@ SNOWFLAKE_CONFIG = {
     'account': os.getenv('SNOWFLAKE_ACCOUNT'),
     'user': os.getenv('SNOWFLAKE_USERNAME'),
     'password': os.getenv('SNOWFLAKE_PASSWORD'),
-    'warehouse': os.getenv('SNOWFLAKE_WAREHOUSE', 'compute_wh'),
-    'database': os.getenv('SNOWFLAKE_DATABASE', 'covid'),
-    'schema': os.getenv('SNOWFLAKE_SCHEMA', 'raw'),
-    'role': os.getenv('SNOWFLAKE_ROLE', 'sysadmin')
+    'warehouse': os.getenv('SNOWFLAKE_WAREHOUSE'),
+    'database': os.getenv('SNOWFLAKE_DATABASE'),
+    'schema': os.getenv('SNOWFLAKE_SCHEMA'),
+    'role': os.getenv('SNOWFLAKE_ROLE')
 }
 
 # External COVID API configuration
-COVID_API_ENDPOINT = os.getenv('COVID_API_ENDPOINT', 'https://disease.sh/v3/covid-19')
+COVID_API_ENDPOINT = os.getenv('COVID_API_ENDPOINT', "https://disease.sh/v3/covid-19/countries")
 SOURCE_NAME = 'disease.sh'  # Source identifier
 
 
@@ -1569,3 +1574,4 @@ class SchemaDiscoveryHandler:
             ON target.source_name = source.source_name AND target.field_path = source.field_path
             WHEN MATCHED THEN
                 UPDATE SET
+                """

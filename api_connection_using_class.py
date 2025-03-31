@@ -22,7 +22,7 @@ import snowflake.connector
 from snowflake.connector.errors import ProgrammingError, DatabaseError
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor
-import backoff
+import backoff 
 
 # Configure logging
 logging.basicConfig(
