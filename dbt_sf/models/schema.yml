@@ -1,0 +1,64 @@
+# File: models/schema.yml
+version: 2
+
+models:
+  - name: covid_metrics
+    description: "COVID-19 metrics by country"
+    columns:
+      - name: country
+        description: "Country name"
+        tests:
+          - unique
+          - not_null
+      - name: cases
+        description: "Total confirmed cases"
+        tests:
+          - not_null
+      - name: deaths
+        description: "Total confirmed deaths"
+      - name: recovered
+        description: "Total recovered cases"
+      - name: active
+        description: "Currently active cases"
+      - name: population
+        description: "Country population"
+      - name: case_fatality_rate
+        description: "Deaths per confirmed case (%)"
+      - name: tests_per_million
+        description: "Tests per million population"
+      - name: source_batch_id
+        description: "Identifier for the source data batch"
+      - name: data_lineage_id
+        description: "Reference to source data for HIPAA compliance"
+
+  - name: covid_regional_metrics
+    description: "COVID-19 metrics aggregated by continent"
+    columns:
+      - name: continent
+        description: "Continent name"
+        tests:
+          - unique
+          - not_null
+      - name: total_cases
+        description: "Total confirmed cases in the continent"
+      - name: total_deaths
+        description: "Total confirmed deaths in the continent"
+      - name: avg_case_fatality_rate
+        description: "Average case fatality rate across countries (%)"
+      - name: lineage_hash
+        description: "Data lineage reference hash for HIPAA compliance"
+
+exposures:
+  - name: covid_dashboard
+    type: dashboard
+    maturity: high
+    url: https://your-dashboard-url.com
+    description: >
+      Executive COVID-19 metrics dashboard showing key indicators
+      by country and region.
+    depends_on:
+      - ref('covid_metrics')
+      - ref('covid_regional_metrics')
+    owner:
+      name: Data Team
+      email: data@example.com

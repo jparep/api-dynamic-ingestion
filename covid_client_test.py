@@ -47,10 +47,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger('covid_pipeline')
 
-# Snowflake connection configuration - Fixed to use SNOWFLAKE_USER not USERNAME
+# Snowflake connection configuration - Fixed to use SNOWFLAKE_USERNAME not SNOWFLAKE_USER
 SNOWFLAKE_CONFIG = {
     'account': os.getenv('SNOWFLAKE_ACCOUNT'),
-    'user': os.getenv('SNOWFLAKE_USERNAME'),  # Using USER instead of USERNAME
+    'user': os.getenv('SNOWFLAKE_USERNAME'),  # Using USERNAME instead of USER
     'password': os.getenv('SNOWFLAKE_PASSWORD'),
     'warehouse': os.getenv('SNOWFLAKE_WAREHOUSE', 'compute_wh'),
     'database': os.getenv('SNOWFLAKE_DATABASE', 'covid'),
@@ -125,19 +125,28 @@ def run_pipeline(record_limit=DEFAULT_RECORD_LIMIT):
             record_hash = hashlib.sha256(json.dumps(item, sort_keys=True).encode()).hexdigest()
             
             try:
-                # Clean and escape the JSON data
-                json_str = json.dumps(item).replace("'", "''")
+                # Convert the JSON to a string and properly escape it for SQL
+                json_str = json.dumps(item)
                 
-                cursor.execute("""
+                # Instead of using the %s parameter binding for the VARIANT column,
+                # use string formatting to insert the JSON directly into the SQL
+                # This avoids the escaping and casting issues
+                sql = f"""
                     INSERT INTO COVID_RAW (
                         source_name, entity_id, source_record, record_hash, load_ts, api_endpoint
-                    ) VALUES (
-                        %s, %s, PARSE_JSON(%s), %s, %s, %s
-                    )
-                """, (
+                    ) 
+                    SELECT 
+                        %s, 
+                        %s, 
+                        PARSE_JSON('{json_str.replace("'", "''")}'), 
+                        %s, 
+                        %s, 
+                        %s
+                """
+                
+                cursor.execute(sql, (
                     SOURCE_NAME,
                     entity_id,
-                    PARSE_JSON('{json_str}'),
                     record_hash,
                     batch_id,
                     COVID_API_ENDPOINT

@@ -1,0 +1,54 @@
+-- File: models/sources.yml
+version: 2
+
+sources:
+  - name: transform_layer
+    database: "{{ env_var('DBT_DATABASE', 'covid') }}"
+    schema: transform
+    tables:
+      - name: TRANSFORM_COVID
+        description: >
+          Dynamically generated transform table from COVID-19 data source.
+          Contains raw data prepared for transformation.
+        columns:
+          - name: transform_id
+            description: "Unique identifier for the transformed record"
+            tests:
+              - unique
+              - not_null
+          - name: entity_id
+            description: "The country or region identifier"
+            tests:
+              - unique
+              - not_null
+          - name: source_raw_id
+            description: "Reference to the source raw record ID"
+          - name: load_ts
+            description: "Batch identifier timestamp"
+          - name: transform_timestamp
+            description: "When the record was added to the transform layer"
+          - name: country
+            description: "Country name"
+          - name: cases
+            description: "Total confirmed cases"
+            tests:
+              - not_null
+              - dbt_utils.expression_is_true:
+                  expression: "CAST(cases AS INT) >= 0"
+          - name: deaths
+            description: "Total confirmed deaths"
+            tests:
+              - dbt_utils.expression_is_true:
+                  expression: "CAST(deaths AS INT) <= CAST(cases AS INT)"
+          - name: recovered
+            description: "Total recovered cases"
+          - name: active
+            description: "Currently active cases"
+          - name: population
+            description: "Country population"
+          - name: continent
+            description: "Continent name"
+        freshness:
+          warn_after: {count: 24, period: hour}
+          error_after: {count: 48, period: hour}
+        loaded_at_field: transform_timestamp

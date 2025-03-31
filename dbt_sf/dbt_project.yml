@@ -1,0 +1,52 @@
+# File: dbt_project.yml
+name: 'covid_analytics'
+version: '1.0.0'
+config-version: 2
+
+profile: 'snowflake'
+
+model-paths: ["models"]
+analysis-paths: ["analyses"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+macro-paths: ["macros"]
+
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+  - "logs"
+
+require-dbt-version: ">=1.5.0"
+
+vars:
+  'dbt_date:time_zone': 'UTC'
+
+models:
+  covid_analytics:
+    core:
+      +schema: core
+      +materialized: table
+      +tags: ['core']
+    mart:
+      +schema: mart
+      +materialized: table
+      +tags: ['mart']
+
+on-run-start:
+  - "{{ log('Starting COVID analytics dbt run at ' ~ modules.datetime.datetime.now(), info=True) }}"
+  - "{{ run_query('CALL transform.CHECK_DATA_QUALITY()') }}"
+
+on-run-end:
+  - "{{ log('Completed COVID analytics dbt run at ' ~ modules.datetime.datetime.now(), info=True) }}"
+  - "{{ run_query('INSERT INTO meta.DBT_RUN_HISTORY (batch_id, dbt_run_id, status, end_time, models_run, models_success) SELECT MAX(batch_id), 0, \"COMPLETED\", CURRENT_TIMESTAMP(), ' ~ model.node_count ~ ', ' ~ model.node_success_count ~ ' FROM meta.DBT_RUN_HISTORY WHERE status = \"RUNNING\"') }}"
+
+packages:
+  - package: dbt-labs/dbt_utils
+    version: 1.1.1
+  - package: dbt-labs/codegen
+    version: 0.11.0
+  - package: dbt-labs/audit_helper
+    version: 0.9.0
+  - package: calogica/dbt_date
+    version: 0.9.0
